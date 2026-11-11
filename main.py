@@ -62,8 +62,9 @@ CATEGORIES = [
     "إلكترونيات",
     "تجميل وعناية",
     "أثاث ومنزلية",
+    "ذهب وإكسسوارات",
 ]
-CATEGORY_ICONS = dict(zip(CATEGORIES, ["🍔", "👗", "📱", "💄", "🛋️"]))
+CATEGORY_ICONS = dict(zip(CATEGORIES, ["🍔", "👗", "📱", "💄", "🛋️", "💍"]))
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))
@@ -114,7 +115,10 @@ SOURCE_LABELS = {
     "instagram": "إنستغرام", "tiktok": "تيك توك", "telegram": "تيليغرام", "facebook": "فيسبوك",
     "whatsapp": "واتساب", "google": "غوغل", "direct": "مباشر", "other": "مواقع أخرى",
 }
-BOT_RE = re.compile(r"bot|crawl|spider|preview|facebookexternalhit|whatsapp|telegram|slurp", re.I)
+# روبوتات المعاينة ومحركات البحث وأدوات الفحص والمراقبة: لا تُحسب زواراً ولا نقرات
+BOT_RE = re.compile(
+    r"bot|crawl|spider|preview|facebookexternalhit|whatsapp|telegram|slurp"
+    r"|curl|wget|python|httpx|go-http|uptime|monitor|pingdom|headless|lighthouse", re.I)
 
 # ─────────────────────────── قاعدة البيانات ───────────────────────────
 
@@ -791,6 +795,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
       <p class="text-sm text-slate-400 line-through">{{ deal.old_price | price }} د.ع</p>
     </div>
     <p class="mt-2 self-start text-sm font-bold text-emerald-300 bg-emerald-400/10 rounded-md px-2 py-1">وفّر {{ deal.savings | price }} د.ع</p>
+    {% if deal.ends_soon %}<p class="mt-2 text-sm font-extrabold text-amber-300">⏳ ينتهي {{ deal.ends_text }}</p>{% endif %}
     <div class="mt-5 md:mt-auto flex gap-2">
       <a href="/go/{{ deal.id }}" target="_blank" rel="nofollow noopener"
          class="flex-1 text-center text-base font-extrabold rounded-full py-3.5 active:scale-95 transition
