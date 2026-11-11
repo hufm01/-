@@ -11,6 +11,7 @@
     ADMIN_PASSWORD  كلمة مرور لوحة الإدارة (إن لم تُحدَّد تُولَّد واحدة عشوائية وتُطبع في الطرفية)
     SECRET_KEY      مفتاح توقيع جلسة الأدمن (اختياري — إن لم يُحدَّد يُشتق من كلمة المرور)
     ZAINCASH_NUMBER رقم زين كاش الذي يظهر في رسالة الإحصائيات الجاهزة
+    CONTACT_WHATSAPP رقم واتساب عام يظهر للزوار في التذييل وصفحة المحلات (اختياري)
     DATABASE_URL    افتراضياً SQLite، ويكفي وضع رابط PostgreSQL للترقية
     DATA_DIR        مجلد قاعدة البيانات والصور (اربطه بقرص دائم على Render/Railway)
 """
@@ -102,6 +103,7 @@ MONTHLY_GOAL = 1_000_000
 SUBSCRIPTION_DAYS = 30
 EXPIRY_WARNING_DAYS = 5
 ZAINCASH_NUMBER = os.getenv("ZAINCASH_NUMBER", "")  # يظهر في رسالة الإحصائيات الجاهزة
+CONTACT_WHATSAPP = os.getenv("CONTACT_WHATSAPP", "")  # رقم واتساب عام للتواصل (يظهر للزوار إن ضُبط)
 
 # تتبع مصدر الزائر: ضع ?src=instagram (أو tiktok / telegram ...) في رابط البايو
 SRC_COOKIE = "src"
@@ -538,7 +540,15 @@ select option{background:#15151c;color:#f1f5f9}
   </div>
 </header>
 <main id="main" class="max-w-5xl mx-auto px-4 pb-16" tabindex="-1">{% block content %}{% endblock %}</main>
-<footer class="text-center text-xs text-slate-400 pb-8">© {{ site_name }} — كل عروض الموصل بمكان واحد</footer>
+<footer class="text-center text-xs text-slate-400 pb-8 space-y-2">
+  <nav class="flex flex-wrap justify-center gap-x-4 gap-y-1 font-bold" aria-label="روابط الموقع">
+    <a href="/join" class="underline">للمحلات والبيجات</a>
+    <a href="/about" class="underline">من نحن</a>
+    <a href="/terms" class="underline">الشروط والخصوصية</a>
+    {% if contact_wa %}<a href="https://wa.me/{{ contact_wa }}" target="_blank" rel="noopener" class="underline">تواصل واتساب</a>{% endif %}
+  </nav>
+  <p>© {{ site_name }} — كل عروض الموصل بمكان واحد</p>
+</footer>
 <script>
 document.addEventListener('click',function(e){
   var b=e.target.closest('[data-share]'); if(!b)return;
@@ -813,6 +823,128 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
 </section>
 {% endif %}
 {% endblock %}""",
+    "join.html": """{% extends "base.html" %}
+{% block title %}للمحلات والبيجات — انشر عرضك في {{ site_name }}{% endblock %}
+{% block content %}
+<section class="pt-8 text-center">
+  <p class="inline-flex items-center gap-2 text-[11px] font-bold tracking-wide text-amber-300 border border-amber-400/40 bg-amber-400/10 rounded-full px-3 py-1">لأصحاب المحلات والبيجات</p>
+  <h1 class="mt-3 text-4xl md:text-6xl font-extrabold leading-[1.2] tracking-tight">وصّل عرضك <span class="glow-text">لزبائن الموصل</span></h1>
+  <p class="mt-3 text-sm md:text-base text-slate-400 max-w-md mx-auto">{{ site_name }} يجمع عروض المدينة بمكان واحد. انشر عرضك، والزبون يضغط ويوصل مباشرة لواتسابك أو صفحتك.</p>
+  <a href="/submit" class="mt-5 inline-block bg-gradient-to-l from-rose-600 to-orange-500 text-white font-extrabold rounded-full px-8 py-3.5 active:scale-95 transition">جرّب شهراً مجاناً</a>
+</section>
+
+<h2 class="mt-10 mb-3 text-lg font-extrabold">شلون يشتغل؟</h2>
+<section class="grid md:grid-cols-3 gap-3">
+  {% for n, t, d in [
+      ('1', 'أرسل عرضك', 'صورة المنتج، السعر قبل وبعد، ورابط صفحتك أو رقم الواتساب. تاخذ دقيقتين.'),
+      ('2', 'نراجعه وننشره', 'نتأكد أن العرض واضح وحقيقي، ثم يظهر في الموقع لكل الزوار.'),
+      ('3', 'تستلم الإحصائية', 'نهاية كل شهر نرسل لك عدد الأشخاص اللي ضغطوا «اطلب العرض» ووصلوا لك.')] %}
+  <div class="glass rounded-3xl p-5">
+    <p class="w-9 h-9 grid place-items-center rounded-full bg-white text-slate-900 font-extrabold">{{ n }}</p>
+    <p class="mt-3 font-extrabold">{{ t }}</p>
+    <p class="mt-1 text-sm text-slate-400">{{ d }}</p>
+  </div>
+  {% endfor %}
+</section>
+
+<h2 class="mt-10 mb-3 text-lg font-extrabold">الباقات</h2>
+<p class="glass rounded-2xl p-4 text-sm font-bold text-emerald-300">🎁 أول شهر مجاناً لكل محل — بدون دفع وبدون التزام. تشوف النتيجة بعينك ثم تقرر.</p>
+<section class="mt-3 grid md:grid-cols-2 gap-3">
+  <div class="rounded-3xl bg-[#15151c] ring-1 ring-white/10 p-5">
+    <p class="font-extrabold">الباقة الأساسية</p>
+    <p class="mt-2 text-3xl font-extrabold">{{ basic_price | price }} <span class="text-sm font-bold text-slate-400">د.ع / شهر</span></p>
+    <ul class="mt-4 space-y-2 text-sm text-slate-300">
+      <li>✓ عرضك منشور طول الشهر</li>
+      <li>✓ تغيّر العرض وقت ما تريد</li>
+      <li>✓ يظهر بفلتر منطقتك وفئتك</li>
+      <li>✓ إحصائية شهرية بعدد النقرات</li>
+    </ul>
+  </div>
+  <div class="rounded-3xl bg-[#15151c] ring-1 ring-amber-400/80 shadow-[0_0_30px_-6px_rgba(251,191,36,.55)] p-5">
+    <p class="font-extrabold"><span class="vip-badge text-amber-950 text-[11px] rounded-full px-2.5 py-1">🔥 VIP</span></p>
+    <p class="mt-2 text-3xl font-extrabold">{{ vip_price | price }} <span class="text-sm font-bold text-slate-400">د.ع / شهر</span></p>
+    <ul class="mt-4 space-y-2 text-sm text-slate-300">
+      <li>✓ كل مميزات الأساسية</li>
+      <li>✓ عرضك مثبّت بأعلى الموقع</li>
+      <li>✓ إطار ذهبي وشارة «عرض مميز»</li>
+      <li>✓ أماكن VIP محدودة حتى يبقى عرضك بارزاً</li>
+    </ul>
+  </div>
+</section>
+<p class="mt-3 text-xs text-slate-500">الدفع شهري عبر زين كاش، وبدون تجديد تلقائي. التفاصيل في <a href="/terms" class="underline">الشروط</a>.</p>
+
+<h2 class="mt-10 mb-3 text-lg font-extrabold">أسئلة متكررة</h2>
+<section class="space-y-2">
+  {% for q, a in [
+      ('شلون تحسبون النقرات؟', 'كل شخص يضغط «اطلب العرض» ينحسب مرة واحدة. الضغط المتكرر من نفس الشخص والروبوتات ما تنحسب، حتى يبقى الرقم صادق.'),
+      ('شنو يصير بعد الشهر المجاني؟', 'نرسل لك الإحصائية وتختار: تكمل بإحدى الباقتين أو توقف. إذا ما تجدد، العرض ينرفع من الموقع وما عليك أي مبلغ.'),
+      ('أكدر أغيّر العرض خلال الشهر؟', 'نعم، راسلنا بالعرض الجديد ونبدّله لك بنفس اليوم.'),
+      ('عندي بس صفحة إنستغرام، يصير؟', 'يصير. الزبون يضغط ويتحول مباشرة لصفحتك أو لواتسابك.')] %}
+  <details class="glass rounded-2xl p-4">
+    <summary class="font-bold cursor-pointer">{{ q }}</summary>
+    <p class="mt-2 text-sm text-slate-400">{{ a }}</p>
+  </details>
+  {% endfor %}
+</section>
+
+<section class="mt-10 rounded-3xl glass p-6 text-center">
+  <p class="text-xl font-extrabold">جاهز تنشر أول عرض؟</p>
+  <div class="mt-4 flex flex-wrap justify-center gap-3">
+    <a href="/submit" class="bg-amber-400 text-amber-950 font-extrabold rounded-full px-6 py-3 active:scale-95 transition">أضف عرضك الآن</a>
+    {% if contact_wa %}<a href="https://wa.me/{{ contact_wa }}" target="_blank" rel="noopener" class="border border-white/20 text-slate-200 font-bold rounded-full px-6 py-3 active:scale-95 transition">راسلنا واتساب</a>{% endif %}
+  </div>
+</section>
+{% endblock %}""",
+    "about.html": """{% extends "base.html" %}
+{% block title %}من نحن — {{ site_name }}{% endblock %}
+{% block content %}
+<article class="max-w-2xl mx-auto pt-8 space-y-4 text-slate-300 leading-relaxed">
+  <h1 class="text-3xl font-extrabold text-white">من نحن</h1>
+  <p><b class="text-white">{{ site_name }}</b> موقع موصلي يجمع عروض وتخفيضات المحلات والمطاعم والبيجات داخل مدينة الموصل بمكان واحد، حتى تلقى أحسن سعر بدون ما تدوّر بعشرين صفحة.</p>
+  <h2 class="text-xl font-extrabold text-white pt-2">شلون تستفيد؟</h2>
+  <p>اختر منطقتك أو الفئة اللي تهمك، تصفّح العروض، واضغط «اطلب العرض» حتى تتحول مباشرة لواتساب المحل أو صفحته. الطلب والدفع والتوصيل يتم بينك وبين المحل مباشرة.</p>
+  <h2 class="text-xl font-extrabold text-white pt-2">ملاحظة مهمة</h2>
+  <p>{{ site_name }} وسيط إعلاني فقط: لا نبيع المنتجات ولا نستلم ثمنها. نراجع العروض قبل نشرها، لكن المحل هو المسؤول عن صحة السعر وتوفّر المنتج وجودته. إذا لقيت عرضاً غير صحيح بلّغنا ونرفعه.</p>
+  <h2 class="text-xl font-extrabold text-white pt-2">عندك محل أو بيج؟</h2>
+  <p>أول شهر مجاناً. <a href="/join" class="underline text-amber-300 font-bold">شوف التفاصيل والباقات</a>.</p>
+  {% if contact_wa %}
+  <h2 class="text-xl font-extrabold text-white pt-2">تواصل معنا</h2>
+  <p><a href="https://wa.me/{{ contact_wa }}" target="_blank" rel="noopener" class="inline-block bg-white text-slate-900 font-bold rounded-full px-6 py-3">راسلنا واتساب</a></p>
+  {% endif %}
+</article>
+{% endblock %}""",
+    "terms.html": """{% extends "base.html" %}
+{% block title %}الشروط والخصوصية — {{ site_name }}{% endblock %}
+{% block content %}
+<article class="max-w-2xl mx-auto pt-8 space-y-3 text-slate-300 leading-relaxed">
+  <h1 class="text-3xl font-extrabold text-white">الشروط والخصوصية</h1>
+
+  <h2 class="text-xl font-extrabold text-white pt-3">للزوار</h2>
+  <ul class="list-disc pr-5 space-y-1">
+    <li>{{ site_name }} وسيط إعلاني: الطلب والدفع والتوصيل والاستبدال بينك وبين المحل مباشرة.</li>
+    <li>الأسعار والعروض مسؤولية المحل المعلن، وقد تتغير أو تنتهي بدون إشعار.</li>
+  </ul>
+
+  <h2 class="text-xl font-extrabold text-white pt-3">للمحلات المعلنة</h2>
+  <ul class="list-disc pr-5 space-y-1">
+    <li>أول شهر مجاني لكل محل، بدون أي التزام بعده.</li>
+    <li>الاشتراك شهري ({{ basic_price | price }} د.ع للأساسية، {{ vip_price | price }} د.ع لـ VIP) ويُدفع مقدماً عبر زين كاش.</li>
+    <li>لا يوجد تجديد تلقائي: إذا لم تجدد يُرفع العرض عند انتهاء المدة.</li>
+    <li>المبلغ المدفوع لا يُسترد بعد بدء نشر العرض، إلا إذا توقف الموقع عن العمل من طرفنا، فتُعوَّض الأيام المفقودة تمديداً.</li>
+    <li>العرض يجب أن يكون حقيقياً: السعر «قبل» هو سعر بيع فعلي، والمنتج متوفر.</li>
+    <li>يحق للإدارة رفض أو إزالة أي عرض مضلل أو مخالف للقانون أو للذوق العام.</li>
+    <li>عدد النقرات يُحسب مرة لكل زائر، وتُستثنى النقرات المكررة والروبوتات.</li>
+  </ul>
+
+  <h2 class="text-xl font-extrabold text-white pt-3">الخصوصية</h2>
+  <ul class="list-disc pr-5 space-y-1">
+    <li>لا نطلب من الزوار تسجيلاً ولا بيانات شخصية.</li>
+    <li>نستعمل ملفات تعريف بسيطة (cookies) لعدّ الزيارات والنقرات بدون تكرار، ولمعرفة المنصة التي جاء منها الزائر.</li>
+    <li>رقم التواصل الذي يدخله صاحب المحل في النموذج لا يُعرض للزوار، ويُستعمل للتواصل معه فقط.</li>
+    <li>لا نبيع أي بيانات ولا نشاركها مع أي طرف.</li>
+  </ul>
+</article>
+{% endblock %}""",
     "admin_login.html": """{% extends "base.html" %}
 {% block title %}دخول الإدارة — {{ site_name }}{% endblock %}
 {% block content %}
@@ -973,6 +1105,9 @@ def render(name: str, status_code: int = 200, **ctx) -> HTMLResponse:
     ctx.setdefault("categories", CATEGORIES)
     ctx.setdefault("category_icons", CATEGORY_ICONS)
     ctx.setdefault("filter_url", filter_url)
+    ctx.setdefault("contact_wa", normalize_phone(CONTACT_WHATSAPP))
+    ctx.setdefault("basic_price", BASIC_PRICE)
+    ctx.setdefault("vip_price", VIP_PRICE)
     return HTMLResponse(jinja.get_template(name).render(**ctx), status_code=status_code)
 
 
@@ -1037,6 +1172,23 @@ def healthz():
     return {"ok": True}
 
 
+# ── صفحات ثابتة: للمحلات، من نحن، الشروط ──
+
+@app.get("/join", response_class=HTMLResponse)
+def join_page():
+    return render("join.html")
+
+
+@app.get("/about", response_class=HTMLResponse)
+def about_page():
+    return render("about.html")
+
+
+@app.get("/terms", response_class=HTMLResponse)
+def terms_page():
+    return render("terms.html")
+
+
 # ── تطبيق الهاتف (PWA) والأيقونة ──
 
 ICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
@@ -1072,7 +1224,7 @@ def robots(request: Request):
 def sitemap(request: Request, db: Session = Depends(get_db)):
     base = str(request.base_url).rstrip("/")
     ids = db.scalars(select(Deal.id).where(Deal.is_approved.is_(True), live_deal())).all()
-    urls = [f"{base}/"] + [f"{base}/deal/{i}" for i in ids]
+    urls = [f"{base}/", f"{base}/join", f"{base}/about", f"{base}/terms"] + [f"{base}/deal/{i}" for i in ids]
     body = ['<?xml version="1.0" encoding="UTF-8"?>',
             '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
     body += [f"<url><loc>{u}</loc></url>" for u in urls]

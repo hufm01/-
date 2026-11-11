@@ -14,6 +14,8 @@ services:
         sync: false
       - key: ZAINCASH_NUMBER       # رقم زين كاش الذي يظهر في رسالة الإحصائيات
         sync: false
+      - key: CONTACT_WHATSAPP      # اختياري: رقم واتساب عام يظهر للزوار
+        sync: false
       - key: SECRET_KEY            # اختياري
         sync: false
     disk:
