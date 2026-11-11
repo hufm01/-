@@ -413,7 +413,7 @@ def detect_source(request: Request) -> str:
 
 def track_visit(request: Request, response, db: Session) -> None:
     """يسجّل الزائر مرة واحدة يومياً مع مصدره، ويحفظ المصدر في كوكي ليُنسب له النقر لاحقاً."""
-    if BOT_RE.search(request.headers.get("user-agent", "")) or is_admin(request):
+    if request.method != "GET" or BOT_RE.search(request.headers.get("user-agent", "")) or is_admin(request):
         return
     detected = detect_source(request)
     source = detected or clean_source(request.cookies.get(SRC_COOKIE)) or "direct"
@@ -1027,7 +1027,7 @@ def _http_error(request: Request, exc: StarletteHTTPException):
     return HTMLResponse(str(exc.detail), status_code=exc.status_code)
 
 
-@app.get("/healthz")
+@app.api_route("/healthz", methods=["GET", "HEAD"])
 def healthz():
     return {"ok": True}
 
@@ -1077,7 +1077,8 @@ def sitemap(request: Request, db: Session = Depends(get_db)):
 
 # ── الصفحة الرئيسية ──
 
-@app.get("/", response_class=HTMLResponse)
+# HEAD مسموح: خدمات مراقبة التشغيل تفحص الموقع به
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def home(request: Request, area: str = "", category: str = "", page: int = 1, q: str = "",
          db: Session = Depends(get_db)):
     page = min(max(page, 1), 1000)
