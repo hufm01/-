@@ -1,0 +1,22 @@
+# Render Blueprint: يُنشئ خدمة الويب وقرصاً دائماً للبيانات والصور.
+# ملاحظة: الأقراص الدائمة متاحة من خطة Starter فما فوق (مدفوعة).
+services:
+  - type: web
+    name: lagta
+    runtime: docker
+    plan: starter
+    region: frankfurt
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATA_DIR
+        value: /data
+      - key: ADMIN_PASSWORD        # تُدخلها أنت في لوحة Render، ولا تُكتب هنا
+        sync: false
+      - key: ZAINCASH_NUMBER       # رقم زين كاش الذي يظهر في رسالة الإحصائيات
+        sync: false
+      - key: SECRET_KEY            # اختياري
+        sync: false
+    disk:
+      name: lagta-data
+      mountPath: /data
+      sizeGB: 5

@@ -1,0 +1,11 @@
+{
+  "name": "lagta",
+  "private": true,
+  "description": "بناء ملف CSS لموقع لقطة (يُشغَّل مرة عند تغيير التنسيقات، والناتج يُحفظ في static/app.css)",
+  "scripts": {
+    "build:css": "tailwindcss -i ./tailwind.input.css -o ./static/app.css --minify"
+  },
+  "devDependencies": {
+    "tailwindcss": "3.4.17"
+  }
+}

@@ -1,0 +1,10 @@
+# الإصدارات التي اختُبر عليها المشروع (~= يسمح بتحديثات الإصلاح فقط)
+fastapi~=0.162.4
+uvicorn[standard]~=0.54.0
+sqlalchemy~=2.1.8
+jinja2~=3.1.6
+python-multipart~=0.0.33
+pillow~=13.0
+psycopg2-binary>=2.9
+
+# للاختبارات فقط:  pip install httpx  ثم  python tests/test_core.py  و  python tests/test_features.py
