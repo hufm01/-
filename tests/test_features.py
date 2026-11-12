@@ -75,11 +75,13 @@ check("free trial label, mrr 0", "تجربة مجانية" in h and "0% من ا�
 check("renew", adm.post("/admin/deals/2/renew").status_code == 303)
 with main.SessionLocal() as db:
     dl = db.get(main.Deal, 2)
-    check("paid_until = today+30", dl.paid_until == main.today() + timedelta(days=30) and dl.days_left == 30)
+    # paying during the free month extends from the END of the trial, so no free days are lost
+    check("renew during trial = trial end + 30", dl.trial_until == main.today() + timedelta(days=30)
+          and dl.paid_until == main.today() + timedelta(days=60) and dl.days_left == 60)
 adm.post("/admin/deals/2/renew")
 adm.post("/admin/deals/2/vip")
 with main.SessionLocal() as db:
-    check("second renew stacks to +60", db.get(main.Deal, 2).days_left == 60)
+    check("second renew stacks to +90", db.get(main.Deal, 2).days_left == 90)
 h = adm.get("/admin").text
 check("mrr = 15,000 (vip)", "15,000 <span" in h and "1% من الهدف" in h and "مشترك حتى" in h)
 

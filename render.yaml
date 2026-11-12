@@ -16,6 +16,12 @@ services:
         sync: false
       - key: CONTACT_WHATSAPP      # اختياري: رقم واتساب عام يظهر للزوار
         sync: false
+      - key: TELEGRAM_BOT_TOKEN    # اختياري: توكن البوت من @BotFather (سرّي)
+        sync: false
+      - key: TELEGRAM_CHANNEL      # اختياري: اسم القناة مثل @lagta_mosul (البوت مشرف فيها)
+        sync: false
+      - key: TELEGRAM_ADMIN_CHAT   # اختياري: رقم محادثتك مع البوت لتصلك تنبيهات العروض الجديدة
+        sync: false
       - key: SECRET_KEY            # اختياري
         sync: false
     disk:

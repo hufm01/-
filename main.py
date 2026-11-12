@@ -23,6 +23,7 @@ import os
 import re
 import secrets
 import time
+import urllib.request
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
@@ -30,7 +31,7 @@ from pathlib import Path
 from typing import Annotated, Optional
 from urllib.parse import urlencode, urlparse
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi import Path as PathParam
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.gzip import GZipMiddleware
@@ -38,7 +39,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from jinja2 import DictLoader, Environment, select_autoescape
 from PIL import Image, ImageOps
-from sqlalchemy import (Boolean, Date, DateTime, Integer, String, create_engine, delete, func,
+from sqlalchemy import (Boolean, Date, DateTime, Integer, String, and_, create_engine, delete, func,
                         inspect, or_, select, text, update)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -94,6 +95,8 @@ MAX_IMAGE_SIDE = 1200
 MAX_IMAGE_PIXELS = 50_000_000  # يمنع صوراً صغيرة الحجم هائلة الأبعاد من استنزاف الذاكرة
 MAX_BODY_BYTES = MAX_IMAGE_BYTES + 1024 * 1024
 PAGE_SIZE = 40
+SORTS = {"": "الأحدث", "discount": "الأكثر خصماً", "price": "الأقل سعراً"}
+HOT_MIN_CLICKS = 3  # أقل عدد نقرات في 7 أيام ليحمل العرض شارة «الأكثر طلباً»
 CLICKED_COOKIE = "clk"  # العروض التي ضغطها الزائر مؤخراً، حتى لا تُحسب النقرة المكررة
 
 # الباقات والهدف الشهري
@@ -102,6 +105,13 @@ VIP_PRICE = 15_000
 MONTHLY_GOAL = 1_000_000
 SUBSCRIPTION_DAYS = 30
 EXPIRY_WARNING_DAYS = 5
+TRIAL_DAYS = 30   # الشهر المجاني يبدأ تلقائياً عند أول نشر للعرض
+GRACE_DAYS = 3    # مهلة بعد انتهاء المدة قبل أن يُخفى العرض تلقائياً
+
+# تيليغرام (اختياري): نشر تلقائي لكل عرض جديد في القناة، وتنبيه لك عند وصول عرض للمراجعة
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")        # مثل @lagta_mosul
+TELEGRAM_ADMIN_CHAT = os.getenv("TELEGRAM_ADMIN_CHAT", "")  # رقم محادثتك مع البوت
 ZAINCASH_NUMBER = os.getenv("ZAINCASH_NUMBER", "")  # يظهر في رسالة الإحصائيات الجاهزة
 CONTACT_WHATSAPP = os.getenv("CONTACT_WHATSAPP", "")  # رقم واتساب عام للتواصل (يظهر للزوار إن ضُبط)
 
@@ -164,6 +174,21 @@ class Deal(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     paid_until: Mapped[Optional[date]] = mapped_column(Date, nullable=True)  # نهاية الاشتراك المدفوع
     ends_on: Mapped[Optional[date]] = mapped_column(Date, nullable=True)  # آخر يوم لصلاحية العرض نفسه
+    trial_until: Mapped[Optional[date]] = mapped_column(Date, nullable=True)  # نهاية الشهر المجاني
+    tg_posted: Mapped[bool] = mapped_column(Boolean, default=False)  # نُشر في قناة تيليغرام
+
+    @property
+    def active_until(self) -> Optional[date]:
+        """آخر يوم يحق للعرض الظهور فيه: الاشتراك المدفوع إن وُجد، وإلا نهاية التجربة. None = دائم."""
+        return self.paid_until or self.trial_until
+
+    @property
+    def is_paid(self) -> bool:
+        return self.paid_until is not None and self.paid_until >= today()
+
+    @property
+    def is_live(self) -> bool:
+        return live(self)
 
     @property
     def ends_soon(self) -> bool:
@@ -176,7 +201,7 @@ class Deal(Base):
 
     @property
     def days_left(self) -> Optional[int]:
-        return (self.paid_until - today()).days if self.paid_until else None
+        return (self.active_until - today()).days if self.active_until else None
 
     @property
     def monthly_fee(self) -> int:
@@ -233,7 +258,8 @@ Base.metadata.create_all(engine)
 def ensure_columns() -> None:
     """ترقية بسيطة لقواعد البيانات القديمة: يضيف الأعمدة الجديدة إن لم تكن موجودة."""
     wanted = {
-        "deals": {"paid_until": "DATE", "ends_on": "DATE"},
+        "deals": {"paid_until": "DATE", "ends_on": "DATE", "trial_until": "DATE",
+                  "tg_posted": "BOOLEAN DEFAULT FALSE"},
         "click_events": {"source": "VARCHAR(20) DEFAULT 'direct'"},
     }
     insp = inspect(engine)
@@ -249,13 +275,30 @@ ensure_columns()
 
 
 def live_deal():
-    """شرط: العرض لم ينتهِ بعد (بدون تاريخ انتهاء = مستمر)."""
-    return or_(Deal.ends_on.is_(None), Deal.ends_on >= today())
+    """شرط SQL: العرض ساري — لم يتجاوز آخر يوم له، واشتراكه أو تجربته المجانية لم تنتهِ.
+
+    الإخفاء تلقائي: بعد انتهاء المدة بـ GRACE_DAYS يختفي العرض وحده، ويعود فور تسجيل الدفعة.
+    """
+    cutoff = today() - timedelta(days=GRACE_DAYS)
+    active = func.coalesce(Deal.paid_until, Deal.trial_until)
+    return and_(
+        or_(Deal.ends_on.is_(None), Deal.ends_on >= today()),
+        or_(active.is_(None), active >= cutoff),
+    )
 
 
 def live(deal: "Deal") -> bool:
-    """هل العرض ساري الآن (لم يتجاوز آخر يوم له)؟"""
-    return deal.ends_on is None or deal.ends_on >= today()
+    """نفس شرط live_deal لكن على عرض واحد محمّل."""
+    if deal.ends_on is not None and deal.ends_on < today():
+        return False
+    until = deal.active_until
+    return until is None or until >= today() - timedelta(days=GRACE_DAYS)
+
+
+def start_trial(deal: "Deal") -> None:
+    """يبدأ الشهر المجاني تلقائياً عند أول نشر لعرض ليس له اشتراك ولا تجربة."""
+    if deal.paid_until is None and deal.trial_until is None:
+        deal.trial_until = today() + timedelta(days=TRIAL_DAYS)
 
 
 def get_db():
@@ -457,6 +500,61 @@ def stats_message(deal: "Deal", clicks: int) -> str:
     return "\n".join(lines)
 
 
+def telegram_call(method: str, payload: dict) -> bool:
+    """ينادي Telegram Bot API. يعيد False عند أي فشل، ولا يكتب التوكن في السجل أبداً."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+        data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return bool(json.load(resp).get("ok"))
+    except Exception as e:
+        print(f"[telegram] {method} failed: {type(e).__name__}")
+        return False
+
+
+def announce_deal(deal_id: int, base: str) -> None:
+    """ينشر العرض في قناة تيليغرام مرة واحدة فقط (يعمل في الخلفية بعد الموافقة)."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL):
+        return
+    with SessionLocal() as db:
+        deal = db.get(Deal, deal_id)
+        if not deal or not deal.is_approved or deal.tg_posted or not live(deal):
+            return
+        caption = "\n".join([
+            f"🔥 {deal.shop_name}",
+            deal.title,
+            "",
+            f"💰 {deal.new_price:,} د.ع بدل {deal.old_price:,} (خصم {deal.discount_percent}%)",
+            f"📍 {deal.area}",
+            "",
+            f"👈 اطلب العرض: {base}/deal/{deal.id}?src=telegram",
+        ])
+        if telegram_call("sendPhoto", {"chat_id": TELEGRAM_CHANNEL, "photo": base + deal.image_url,
+                                       "caption": caption}):
+            deal.tg_posted = True
+            db.commit()
+
+
+def notify_admin(deal_id: int, base: str) -> None:
+    """ينبّه المدير على تيليغرام فور وصول عرض جديد يحتاج موافقة."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_CHAT):
+        return
+    with SessionLocal() as db:
+        deal = db.get(Deal, deal_id)
+        if not deal:
+            return
+        text = (f"🆕 عرض جديد بانتظار موافقتك\n{deal.shop_name} — {deal.title}\n"
+                f"{deal.new_price:,} د.ع بدل {deal.old_price:,}\n\n{base}/admin")
+    telegram_call("sendMessage", {"chat_id": TELEGRAM_ADMIN_CHAT, "text": text})
+
+
+def site_base(request: Request) -> str:
+    return str(request.base_url).rstrip("/")
+
+
 def validate_deal(shop_name, title, category, area, old_price, new_price, link, contact_phone):
     """يعيد (البيانات النظيفة، قائمة الأخطاء)."""
     errors: list[str] = []
@@ -527,7 +625,12 @@ TEMPLATES = {
 select option{background:#15151c;color:#f1f5f9}
 @keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:.35}}
 .live-dot{animation:pulse-dot 1.6s ease-in-out infinite}
-@media (prefers-reduced-motion:reduce){.vip-badge,.live-dot{animation:none}}
+@keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+.deal-card{animation:rise .45s ease both}
+.deal-card:nth-child(2){animation-delay:.05s}.deal-card:nth-child(3){animation-delay:.1s}
+.deal-card:nth-child(4){animation-delay:.15s}.deal-card:nth-child(n+5){animation-delay:.2s}
+@media (hover:hover){.deal-card{transition:transform .25s,box-shadow .25s}.deal-card:hover{transform:translateY(-4px)}}
+@media (prefers-reduced-motion:reduce){.vip-badge,.live-dot,.deal-card{animation:none}}
 </style>
 </head>
 <body class="overflow-x-clip font-sans antialiased {% block body %}bg-[#0a0a0f] text-slate-100{% endblock %}">
@@ -560,11 +663,11 @@ document.addEventListener('click',function(e){
 </script>
 </body>
 </html>""",
-    "macros.html": """{% macro card(d) %}
-<article class="group relative flex flex-col bg-[#15151c] rounded-3xl overflow-hidden
+    "macros.html": """{% macro card(d, hot=false) %}
+<article class="deal-card group relative flex flex-col bg-[#15151c] rounded-3xl overflow-hidden
   {{ 'ring-1 ring-amber-400/80 shadow-[0_0_30px_-6px_rgba(251,191,36,.55)]' if d.is_vip else 'ring-1 ring-white/10' }}">
-  <div class="relative aspect-square bg-white/5">
-    <a href="/deal/{{ d.id }}" class="block w-full h-full"><img src="{{ d.image_url }}" alt="{{ d.title }}" loading="lazy" decoding="async" class="w-full h-full object-cover"></a>
+  <div class="relative aspect-square bg-white/5 overflow-hidden">
+    <a href="/deal/{{ d.id }}" class="block w-full h-full"><img src="{{ d.image_url }}" alt="{{ d.title }}" loading="lazy" decoding="async" class="w-full h-full object-cover transition duration-500 group-hover:scale-105"></a>
     <span class="absolute bottom-2 left-2 bg-rose-600 text-white text-sm font-extrabold rounded-lg px-2 py-0.5 shadow" dir="ltr">-{{ d.discount_percent }}%</span>
     {% if d.is_vip %}
     <span class="vip-badge absolute top-2 right-2 text-amber-950 text-[11px] font-extrabold rounded-full px-2.5 py-1 shadow">🔥 عرض مميز</span>
@@ -577,6 +680,7 @@ document.addEventListener('click',function(e){
     </button>
   </div>
   <div class="flex flex-col flex-1 p-3">
+    {% if hot %}<p class="self-start mb-1 text-[10px] font-extrabold text-orange-300 bg-orange-400/10 border border-orange-400/30 rounded-full px-2 py-0.5">📈 الأكثر طلباً</p>{% endif %}
     <p class="text-xs font-bold text-rose-400 truncate">{{ d.shop_name }}</p>
     <h3 class="text-sm font-bold leading-snug mt-0.5 line-clamp-2 min-h-[2.5rem]"><a href="/deal/{{ d.id }}">{{ d.title }}</a></h3>
     <p class="text-[11px] text-slate-400 mt-1 truncate">📍 {{ d.area }}</p>
@@ -607,8 +711,26 @@ document.addEventListener('click',function(e){
     <span class="live-dot w-1.5 h-1.5 rounded-full bg-amber-400"></span>لقطات جديدة كل يوم</p>
   <h1 class="mt-3 text-4xl md:text-6xl font-extrabold leading-[1.2] tracking-tight">لا تفوّت <span class="glow-text">لقطة</span><br>بالموصل</h1>
   <p class="mt-3 text-sm md:text-base text-slate-400 max-w-md mx-auto">تخفيضات المحلات والمطاعم والبيجات، مرتّبة حسب منطقتك. اختر العرض واطلبه مباشرة.</p>
-  <p class="mt-4 inline-block text-sm font-bold text-white glass rounded-full px-4 py-1.5">{{ total }} عرض متاح الآن</p>
+  {% if total %}
+  <dl class="mt-5 grid grid-cols-3 gap-2 max-w-sm mx-auto">
+    {% for value, label in [(total, 'عرض متاح'), (shops, 'محل وبيج'), (best_discount ~ '%', 'أعلى خصم')] %}
+    <div class="glass rounded-2xl py-2.5">
+      <dd class="text-xl font-extrabold text-white" dir="ltr">{{ value }}</dd>
+      <dt class="text-[11px] text-slate-400">{{ label }}</dt>
+    </div>
+    {% endfor %}
+  </dl>
+  {% endif %}
 </section>
+
+{% if not total %}
+<section class="mt-6 rounded-3xl glass p-8 text-center">
+  <p class="text-5xl">🚀</p>
+  <h2 class="mt-3 text-2xl font-extrabold">أول اللقطات <span class="glow-text">بالطريق</span></h2>
+  <p class="mt-2 text-sm text-slate-400 max-w-sm mx-auto">دنجمع أقوى عروض محلات الموصل. ارجع قريباً، أو إذا عندك محل خلّي عرضك من أول العروض.</p>
+  <a href="/join" class="mt-5 inline-block bg-gradient-to-l from-rose-600 to-orange-500 text-white font-extrabold rounded-full px-7 py-3 active:scale-95 transition">انشر عرضك مجاناً</a>
+</section>
+{% else %}
 
 <section class="pt-3 space-y-2">
   <form action="/" method="get" role="search" class="relative">
@@ -617,14 +739,22 @@ document.addEventListener('click',function(e){
            class="w-full rounded-full bg-white/5 border border-white/10 text-white placeholder-slate-500 px-5 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-rose-500">
     {% if area %}<input type="hidden" name="area" value="{{ area }}">{% endif %}
     {% if category %}<input type="hidden" name="category" value="{{ category }}">{% endif %}
+    {% if sort %}<input type="hidden" name="sort" value="{{ sort }}">{% endif %}
   </form>
   <div class="flex gap-2 overflow-x-auto no-scrollbar -mx-4 px-4">
-    {{ chip('الكل', filter_url(area, ''), not category) }}
-    {% for c in categories %}{{ chip(category_icons[c] ~ ' ' ~ c, filter_url(area, c), c == category) }}{% endfor %}
+    {{ chip('الكل', furl(area, ''), not category) }}
+    {% for c in categories %}{{ chip(category_icons[c] ~ ' ' ~ c, furl(area, c), c == category) }}{% endfor %}
   </div>
   <div class="flex gap-2 overflow-x-auto no-scrollbar -mx-4 px-4">
-    {{ chip('📍 كل المناطق', filter_url('', category), not area) }}
-    {% for a in areas %}{{ chip(a, filter_url(a, category), a == area) }}{% endfor %}
+    {{ chip('📍 كل المناطق', furl('', category), not area) }}
+    {% for a in areas %}{{ chip(a, furl(a, category), a == area) }}{% endfor %}
+  </div>
+  <div class="flex items-center gap-1.5 pt-1 text-xs">
+    <span class="text-slate-500 font-bold">الترتيب:</span>
+    {% for key, label in sorts.items() %}
+    <a href="{{ furl(area, category, 1, key) }}" {{ 'aria-current=true' if key == sort }}
+       class="rounded-full px-3 py-1.5 font-bold transition {{ 'bg-white/15 text-white' if key == sort else 'text-slate-400' }}">{{ label }}</a>
+    {% endfor %}
   </div>
 </section>
 
@@ -634,13 +764,13 @@ document.addEventListener('click',function(e){
 {% if vip %}
 <h2 class="mt-5 mb-2 text-base font-extrabold">🔥 عروض مميزة</h2>
 <section class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
-  {% for d in vip %}{{ card(d) }}{% endfor %}
+  {% for d in vip %}{{ card(d, d.id in hot_ids) }}{% endfor %}
 </section>
 {% endif %}
 {% if normal %}
-<h2 class="mt-5 mb-2 text-base font-extrabold">أحدث العروض <span class="text-sm font-medium text-slate-400">({{ normal | length }})</span></h2>
+<h2 class="mt-5 mb-2 text-base font-extrabold">{{ 'نتائج البحث' if q else ('أحدث العروض' if not sort else sorts[sort]) }} <span class="text-sm font-medium text-slate-400">({{ normal | length }})</span></h2>
 <section class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
-  {% for d in normal %}{{ card(d) }}{% endfor %}
+  {% for d in normal %}{{ card(d, d.id in hot_ids) }}{% endfor %}
 </section>
 {% endif %}
 
@@ -664,8 +794,9 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
 <div class="mt-16 text-center text-slate-500">
   <p class="text-5xl">🛍️</p>
   <p class="mt-3 font-bold">لا توجد عروض بهذه الفلترة حالياً</p>
-  <a href="/" class="mt-3 inline-block text-rose-600 font-bold underline">عرض كل العروض</a>
+  <a href="/" class="mt-3 inline-block text-rose-400 font-bold underline">عرض كل العروض</a>
 </div>
+{% endif %}
 {% endif %}
 {% endblock %}""",
     "deal_form.html": """{% extends "base.html" %}
@@ -719,8 +850,13 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
              class="mt-2 block w-full text-sm file:ml-3 file:rounded-full file:border-0 file:bg-rose-50 file:text-rose-700 file:font-bold file:px-4 file:py-2"></label>
 
     {% if deal %}
-    <label class="block"><span class="text-sm font-bold">الاشتراك المدفوع ينتهي في <span class="font-normal text-slate-400">(فارغ = تجربة مجانية)</span></span>
-      <input type="date" name="paid_until" value="{{ form.paid_until }}" class="{{ inp }} mt-1"></label>
+    <div class="grid grid-cols-2 gap-3">
+      <label class="block"><span class="text-sm font-bold">التجربة المجانية حتى</span>
+        <input type="date" name="trial_until" value="{{ form.trial_until }}" class="{{ inp }} mt-1"></label>
+      <label class="block"><span class="text-sm font-bold">الاشتراك المدفوع حتى</span>
+        <input type="date" name="paid_until" value="{{ form.paid_until }}" class="{{ inp }} mt-1"></label>
+    </div>
+    <p class="-mt-2 text-xs text-slate-400">يُخفى العرض تلقائياً بعد انتهاء المدة. اترك التاريخين فارغين ليبقى العرض دائماً.</p>
     <div class="flex gap-6 glass rounded-xl p-3">
       <label class="flex items-center gap-2 text-sm font-bold"><input type="checkbox" name="is_approved" value="1" {{ 'checked' if form.is_approved }} class="w-5 h-5 accent-emerald-600"> منشور (موافَق عليه)</label>
       <label class="flex items-center gap-2 text-sm font-bold"><input type="checkbox" name="is_vip" value="1" {{ 'checked' if form.is_vip }} class="w-5 h-5 accent-amber-500"> 🔥 VIP</label>
@@ -806,6 +942,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
     </div>
     <p class="mt-2 self-start text-sm font-bold text-emerald-300 bg-emerald-400/10 rounded-md px-2 py-1">وفّر {{ deal.savings | price }} د.ع</p>
     {% if deal.ends_soon %}<p class="mt-2 text-sm font-extrabold text-amber-300">⏳ ينتهي {{ deal.ends_text }}</p>{% endif %}
+    {% if deal.clicks_count >= 5 %}<p class="mt-2 text-xs text-slate-400">👥 {{ deal.clicks_count | price }} شخص طلبوا هذا العرض</p>{% endif %}
     <div class="mt-5 md:mt-auto flex gap-2">
       <a href="/go/{{ deal.id }}" target="_blank" rel="nofollow noopener"
          class="flex-1 text-center text-base font-extrabold rounded-full py-3.5 active:scale-95 transition
@@ -1012,12 +1149,23 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   <button type="button" data-tab="{{ key }}" class="shrink-0 rounded-full px-3.5 py-2 text-sm font-bold border border-slate-200 bg-white text-slate-600">{{ label }}</button>
   {% endfor %}
 </div>
-<p class="mt-2 text-xs text-slate-400">العروض التي تضيفها أنت من زر «أضف عرض محلك» تُنشر مباشرة.</p>
+<details class="mt-2 bg-white rounded-2xl border border-slate-100 p-3 text-xs text-slate-600">
+  <summary class="font-bold cursor-pointer text-slate-800">⚙️ ما يعمل تلقائياً</summary>
+  <ul class="mt-2 space-y-1 leading-relaxed">
+    <li>✓ الموافقة على عرض تبدأ شهره المجاني ({{ trial_days }} يوماً) تلقائياً.</li>
+    <li>✓ بعد انتهاء المدة بـ {{ grace_days }} أيام بدون دفع يُخفى العرض وحده، ويعود فور الضغط على «دفع».</li>
+    <li>✓ العرض الذي له «آخر يوم» يختفي بعده تلقائياً.</li>
+    <li>✓ العروض التي تضيفها أنت من «أضف عرض محلك» تُنشر مباشرة.</li>
+    <li>✓ شارة «الأكثر طلباً» وأرقام الواجهة تُحسب من النقرات الفعلية.</li>
+    <li>{{ '✓' if tg_channel else '✗' }} نشر كل عرض جديد في قناة تيليغرام{{ '' if tg_channel else ' — غير مفعّل: أضف TELEGRAM_BOT_TOKEN و TELEGRAM_CHANNEL في Render' }}.</li>
+    <li>{{ '✓' if tg_admin else '✗' }} تنبيهك على تيليغرام عند وصول عرض للمراجعة{{ '' if tg_admin else ' — غير مفعّل: أضف TELEGRAM_ADMIN_CHAT في Render' }}.</li>
+  </ul>
+</details>
 
 <section class="mt-3 space-y-3">
   {% for d in deals %}
   <div data-deal data-status="{{ 'live' if d.is_approved else 'pending' }}" data-vip="{{ 1 if d.is_vip else 0 }}"
-       data-expiring="{{ 1 if d.paid_until is not none and d.days_left <= warn_days else 0 }}"
+       data-expiring="{{ 1 if d.active_until is not none and d.days_left <= warn_days else 0 }}"
        class="bg-white rounded-2xl p-3 border {{ 'border-slate-100' if d.is_approved else 'border-rose-300 bg-rose-50/40' }}">
     <div class="flex gap-3">
       <img src="{{ d.image_url }}" alt="" loading="lazy" class="w-20 h-20 rounded-xl object-cover shrink-0">
@@ -1040,10 +1188,17 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
     </div>
     <p class="text-[11px] text-slate-400 mt-2 truncate" dir="ltr">{{ d.link_url }}{% if d.contact_phone %} · ☎ {{ d.contact_phone }}{% endif %} · {{ d.created_at.strftime('%Y-%m-%d') }}</p>
     <p class="text-xs font-bold mt-1">
-      {% if d.paid_until is none %}<span class="text-slate-400">تجربة مجانية — لا يوجد اشتراك مدفوع</span>
-      {% elif d.days_left < 0 %}<span class="text-rose-600">⛔ انتهى الاشتراك منذ {{ -d.days_left }} يوم</span>
-      {% elif d.days_left <= warn_days %}<span class="text-amber-600">⏳ الاشتراك ينتهي خلال {{ d.days_left }} يوم</span>
-      {% else %}<span class="text-emerald-600">✓ مشترك حتى {{ d.paid_until }} ({{ d.monthly_fee | price }} د.ع)</span>{% endif %}
+      {% if d.is_approved and not d.is_live %}<span class="bg-slate-800 text-white rounded px-1.5 py-0.5">مخفي تلقائياً</span>{% endif %}
+      {% if d.paid_until is not none %}
+        {% if d.days_left < 0 %}<span class="text-rose-600">⛔ انتهى الاشتراك منذ {{ -d.days_left }} يوم</span>
+        {% elif d.days_left <= warn_days %}<span class="text-amber-600">⏳ الاشتراك ينتهي خلال {{ d.days_left }} يوم</span>
+        {% else %}<span class="text-emerald-600">✓ مشترك حتى {{ d.paid_until }} ({{ d.monthly_fee | price }} د.ع)</span>{% endif %}
+      {% elif d.trial_until is not none %}
+        {% if d.days_left < 0 %}<span class="text-rose-600">⛔ انتهت التجربة المجانية منذ {{ -d.days_left }} يوم</span>
+        {% elif d.days_left <= warn_days %}<span class="text-amber-600">⏳ التجربة المجانية تنتهي خلال {{ d.days_left }} يوم</span>
+        {% else %}<span class="text-sky-600">🎁 تجربة مجانية حتى {{ d.trial_until }}</span>{% endif %}
+      {% else %}<span class="text-slate-400">دائم — بدون مدة اشتراك</span>{% endif %}
+      {% if d.ends_on is not none and d.ends_on < today %}<span class="text-slate-500"> · العرض نفسه انتهى {{ d.ends_on }}</span>{% endif %}
     </p>
     <div class="mt-2 flex flex-wrap gap-2">
       <form method="post" action="/admin/deals/{{ d.id }}/approve">
@@ -1111,8 +1266,8 @@ def render(name: str, status_code: int = 200, **ctx) -> HTMLResponse:
     return HTMLResponse(jinja.get_template(name).render(**ctx), status_code=status_code)
 
 
-def filter_url(area: str = "", category: str = "", page: int = 1) -> str:
-    params = {k: v for k, v in (("area", area), ("category", category)) if v}
+def filter_url(area: str = "", category: str = "", page: int = 1, sort: str = "", q: str = "") -> str:
+    params = {k: v for k, v in (("q", q), ("area", area), ("category", category), ("sort", sort)) if v}
     if page > 1:
         params["page"] = page
     return "/?" + urlencode(params) if params else "/"
@@ -1237,7 +1392,7 @@ def sitemap(request: Request, db: Session = Depends(get_db)):
 # HEAD مسموح: خدمات مراقبة التشغيل تفحص الموقع به
 @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def home(request: Request, area: str = "", category: str = "", page: int = 1, q: str = "",
-         db: Session = Depends(get_db)):
+         sort: str = "", db: Session = Depends(get_db)):
     page = min(max(page, 1), 1000)
     area = area if area in AREAS else ""
     category = category if category in CATEGORIES else ""
@@ -1252,16 +1407,36 @@ def home(request: Request, area: str = "", category: str = "", page: int = 1, q:
         stmt = stmt.where(Deal.area.in_([area, CITYWIDE]))
     if category:
         stmt = stmt.where(Deal.category == category)
+    # الترتيب: VIP أولاً دائماً، ثم حسب اختيار الزائر
+    sort = sort if sort in SORTS else ""
+    discount = (Deal.old_price - Deal.new_price) * 100.0 / Deal.old_price
+    order = {"discount": [discount.desc()], "price": [Deal.new_price.asc()]}.get(sort, [])
     # نطلب عرضاً إضافياً واحداً لنعرف هل توجد صفحة تالية
-    stmt = (stmt.order_by(Deal.is_vip.desc(), Deal.created_at.desc(), Deal.id.desc())
+    stmt = (stmt.order_by(Deal.is_vip.desc(), *order, Deal.created_at.desc(), Deal.id.desc())
             .offset((page - 1) * PAGE_SIZE).limit(PAGE_SIZE + 1))
     deals = db.scalars(stmt).all()
     has_next = len(deals) > PAGE_SIZE
 
-    total = db.scalar(select(func.count()).select_from(Deal).where(Deal.is_approved.is_(True), live_deal()))
-    resp = render("home.html", deals=deals[:PAGE_SIZE], area=area, category=category, total=total, q=q,
-                  prev_url=filter_url(area, category, page - 1) if page > 1 else "",
-                  next_url=filter_url(area, category, page + 1) if has_next else "")
+    # أرقام الواجهة تُحسب تلقائياً من العروض السارية
+    is_live = (Deal.is_approved.is_(True), live_deal())
+    total, shops, best = db.execute(
+        select(func.count(), func.count(func.distinct(Deal.shop_name)), func.max(discount)).where(*is_live)
+    ).one()
+
+    # «الأكثر طلباً»: أعلى 3 عروض نقرات خلال آخر 7 أيام (بحد أدنى حتى لا تظهر الشارة على نقرتين)
+    hot_ids = {deal_id for deal_id, n in db.execute(
+        select(ClickEvent.deal_id, func.count()).where(ClickEvent.created_at >= utcnow() - timedelta(days=7))
+        .group_by(ClickEvent.deal_id).order_by(func.count().desc()).limit(3)
+    ).all() if n >= HOT_MIN_CLICKS}
+
+    def furl(a=area, c=category, p=1, s=sort):
+        return filter_url(a, c, p, s, q)
+
+    resp = render("home.html", deals=deals[:PAGE_SIZE], area=area, category=category, q=q, sort=sort,
+                  total=total, shops=shops, best_discount=round(best or 0), hot_ids=hot_ids,
+                  furl=furl, sorts=SORTS,
+                  prev_url=furl(p=page - 1) if page > 1 else "",
+                  next_url=furl(p=page + 1) if has_next else "")
     track_visit(request, resp, db)
     return resp
 
@@ -1348,7 +1523,7 @@ def submit_form(request: Request):
 
 @app.post("/submit", response_class=HTMLResponse)
 def submit_deal(
-    request: Request,
+    request: Request, background: BackgroundTasks,
     shop_name: str = Form(""), title: str = Form(""), category: str = Form(""), area: str = Form(""),
     old_price: str = Form(""), new_price: str = Form(""), link: str = Form(""),
     contact_phone: str = Form(""), website: str = Form(""), ends_on: str = Form(""),
@@ -1387,9 +1562,14 @@ def submit_deal(
     if errors:
         return _submit_page(form, errors, admin, 400)
 
-    db.add(Deal(**data, is_approved=admin))
+    deal = Deal(**data, is_approved=admin)
+    if admin:
+        start_trial(deal)  # عروضك تُنشر فوراً ويبدأ شهرها المجاني
+    db.add(deal)
     db.commit()
     record_hit(rate_key)
+    # تلقائياً: عرض المدير يُنشر في القناة، وعرض الزائر يصلك تنبيه به للمراجعة
+    background.add_task(announce_deal if admin else notify_admin, deal.id, site_base(request))
 
     if admin:
         return RedirectResponse("/admin", status_code=303)
@@ -1446,7 +1626,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
         clicks=sum(d.clicks_count for d in deals),
         clicks_30d=sum(clicks_30d.values()),
         # الدخل الشهري = اشتراكات سارية لعروض منشورة
-        mrr=sum(d.monthly_fee for d in deals if d.is_approved and d.paid_until and d.days_left >= 0),
+        mrr=sum(d.monthly_fee for d in deals if d.is_approved and d.is_paid),
     )
 
     # مصادر الزوار والنقرات خلال آخر 30 يوماً
@@ -1466,7 +1646,10 @@ def admin_dashboard(db: Session = Depends(get_db)):
     messages = {d.id: stats_message(d, clicks_30d.get(d.id, 0)) for d in deals}
 
     return render("admin.html", deals=deals, stats=stats, clicks_30d=clicks_30d, sources=sources,
-                  messages=messages, goal=MONTHLY_GOAL, warn_days=EXPIRY_WARNING_DAYS,
+                  messages=messages, goal=MONTHLY_GOAL, warn_days=EXPIRY_WARNING_DAYS, today=today(),
+                  tg_channel=bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL),
+                  tg_admin=bool(TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_CHAT),
+                  trial_days=TRIAL_DAYS, grace_days=GRACE_DAYS,
                   goal_percent=min(100, stats["mrr"] * 100 // MONTHLY_GOAL))
 
 
@@ -1478,9 +1661,13 @@ def _get_deal(db: Session, deal_id: int) -> Deal:
 
 
 @app.post("/admin/deals/{deal_id}/approve", dependencies=[Depends(require_admin)])
-def admin_toggle_approve(deal_id: DealId, db: Session = Depends(get_db)):
+def admin_toggle_approve(deal_id: DealId, request: Request, background: BackgroundTasks,
+                         db: Session = Depends(get_db)):
     deal = _get_deal(db, deal_id)
     deal.is_approved = not deal.is_approved
+    if deal.is_approved:
+        start_trial(deal)  # الموافقة تبدأ الشهر المجاني تلقائياً
+        background.add_task(announce_deal, deal.id, site_base(request))
     db.commit()
     return RedirectResponse("/admin", status_code=303)
 
@@ -1494,13 +1681,18 @@ def admin_toggle_vip(deal_id: DealId, db: Session = Depends(get_db)):
 
 
 @app.post("/admin/deals/{deal_id}/renew", dependencies=[Depends(require_admin)])
-def admin_renew(deal_id: DealId, db: Session = Depends(get_db)):
-    """تسجيل دفعة: يمدّد الاشتراك 30 يوماً من تاريخ انتهائه (أو من اليوم إن كان منتهياً) وينشر العرض."""
+def admin_renew(deal_id: DealId, request: Request, background: BackgroundTasks,
+                db: Session = Depends(get_db)):
+    """تسجيل دفعة: يمدّد 30 يوماً من نهاية المدة الحالية (اشتراكاً أو تجربة)، أو من اليوم إن انتهت.
+
+    من يدفع أثناء شهره المجاني لا يخسر أيامه الباقية. والعرض المخفي يعود للظهور فوراً.
+    """
     deal = _get_deal(db, deal_id)
-    start = max(deal.paid_until or today(), today())
+    start = max(deal.active_until or today(), today())
     deal.paid_until = start + timedelta(days=SUBSCRIPTION_DAYS)
     deal.is_approved = True
     db.commit()
+    background.add_task(announce_deal, deal.id, site_base(request))
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -1529,24 +1721,26 @@ def admin_edit_page(deal_id: DealId, db: Session = Depends(get_db)):
                 old_price=deal.old_price, new_price=deal.new_price, link=deal.link_url,
                 contact_phone=deal.contact_phone, is_approved=deal.is_approved, is_vip=deal.is_vip,
                 paid_until=deal.paid_until.isoformat() if deal.paid_until else "",
+                trial_until=deal.trial_until.isoformat() if deal.trial_until else "",
                 ends_on=deal.ends_on.isoformat() if deal.ends_on else "")
     return _edit_page(deal, form, [])
 
 
 @app.post("/admin/deals/{deal_id}/edit", dependencies=[Depends(require_admin)])
 def admin_edit(
-    deal_id: DealId,
+    deal_id: DealId, request: Request, background: BackgroundTasks,
     shop_name: str = Form(""), title: str = Form(""), category: str = Form(""), area: str = Form(""),
     old_price: str = Form(""), new_price: str = Form(""), link: str = Form(""),
     contact_phone: str = Form(""), is_approved: str = Form(""), is_vip: str = Form(""),
-    paid_until: str = Form(""), ends_on: str = Form(""),
+    paid_until: str = Form(""), trial_until: str = Form(""), ends_on: str = Form(""),
     image: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
 ):
     deal = _get_deal(db, deal_id)
     form = dict(shop_name=shop_name, title=title, category=category, area=area,
                 old_price=old_price, new_price=new_price, link=link, contact_phone=contact_phone,
-                is_approved=bool(is_approved), is_vip=bool(is_vip), paid_until=paid_until)
+                is_approved=bool(is_approved), is_vip=bool(is_vip), paid_until=paid_until,
+                trial_until=trial_until, ends_on=ends_on)
 
     data, errors = validate_deal(shop_name, title, category, area, old_price, new_price, link, contact_phone)
     try:
@@ -1557,6 +1751,10 @@ def admin_edit(
     if not ends_ok:
         errors.append("تاريخ انتهاء العرض غير صحيح")
     data["ends_on"] = ends
+    trial, trial_ok = parse_optional_date(trial_until)
+    if not trial_ok:
+        errors.append("تاريخ نهاية التجربة المجانية غير صحيح")
+    data["trial_until"] = trial
     old_image = None
     if not errors and image and image.filename:
         try:
@@ -1567,13 +1765,18 @@ def admin_edit(
     if errors:
         return _edit_page(deal, form, errors, 400)
 
+    newly_published = bool(is_approved) and not deal.is_approved
     for key, value in data.items():
         setattr(deal, key, value)
     deal.is_approved = bool(is_approved)
     deal.is_vip = bool(is_vip)
+    if newly_published:
+        start_trial(deal)  # فقط عند أول نشر: مسح التاريخين يدوياً يجعل العرض دائماً
     db.commit()
     if old_image:
         delete_image(old_image)
+    if deal.is_approved:
+        background.add_task(announce_deal, deal.id, site_base(request))
     return RedirectResponse("/admin", status_code=303)
 
 
