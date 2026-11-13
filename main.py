@@ -42,8 +42,8 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from jinja2 import DictLoader, Environment, select_autoescape
 from PIL import Image, ImageOps
-from sqlalchemy import (Boolean, Date, DateTime, Integer, String, and_, create_engine, delete, func,
-                        inspect, or_, select, text, update)
+from sqlalchemy import (Boolean, Date, DateTime, Integer, String, UniqueConstraint, and_, create_engine,
+                        delete, func, inspect, or_, select, text, update)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -195,6 +195,7 @@ class Deal(Base):
     tg_posted: Mapped[bool] = mapped_column(Boolean, default=False)  # نُشر في قناة تيليغرام
     shop_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)  # صاحبه في البوابة
     paused: Mapped[bool] = mapped_column(Boolean, default=False)  # أوقفه صاحب المحل مؤقتاً
+    followers_notified: Mapped[bool] = mapped_column(Boolean, default=False)  # وصل لمتابعي المحل
 
     @property
     def active_until(self) -> Optional[date]:
@@ -271,6 +272,41 @@ class Visit(Base):
     count: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class DealTip(Base):
+    """مشترٍ بلّغ عن عرض رآه في محل غير مسجّل: فرصة لجلب محل جديد ومعك دليل اهتمام الزبائن."""
+
+    __tablename__ = "deal_tips"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    shop_name: Mapped[str] = mapped_column(String(80))
+    where: Mapped[str] = mapped_column(String(300))   # رابط صفحة المحل أو رقمه أو مكانه
+    note: Mapped[str] = mapped_column(String(300), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class CodeSale(Base):
+    """زبائن سجّلهم المحل لأنهم قالوا «كود لقطة»: دليل مبيعات، لا مجرد نقرات."""
+
+    __tablename__ = "code_sales"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    shop_id: Mapped[int] = mapped_column(Integer, index=True)
+    count: Mapped[int] = mapped_column(Integer)
+    day: Mapped[date] = mapped_column(Date, index=True)
+
+
+class ShopFollower(Base):
+    """مشترٍ يتابع محلاً عبر بوت تيليغرام: يصله كل عرض جديد من المحل."""
+
+    __tablename__ = "shop_followers"
+    __table_args__ = (UniqueConstraint("shop_id", "chat_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    shop_id: Mapped[int] = mapped_column(Integer, index=True)
+    chat_id: Mapped[str] = mapped_column(String(32), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class DealView(Base):
     """مشاهدات صفحة العرض يومياً (زائر واحد = مرة كل 6 ساعات). مع النقرات تعطي «نسبة الطلب»."""
 
@@ -301,7 +337,13 @@ class Shop(Base):
     reset_hash: Mapped[str] = mapped_column(String(64), default="")
     reset_expires: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     reminded_on: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    code_offer: Mapped[str] = mapped_column(String(80), default="")  # ما يحصل عليه من يقول الكود
+    reported_on: Mapped[Optional[date]] = mapped_column(Date, nullable=True)  # آخر تقرير أسبوعي
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    @property
+    def code(self) -> str:
+        return f"LAGTA{self.id}"
 
     @property
     def active_until(self) -> Optional[date]:
@@ -351,8 +393,11 @@ def ensure_columns() -> None:
     wanted = {
         "deals": {"paid_until": "DATE", "ends_on": "DATE", "trial_until": "DATE",
                   "tg_posted": "BOOLEAN DEFAULT FALSE", "shop_id": "INTEGER",
-                  "paused": "BOOLEAN DEFAULT FALSE"},
+                  "paused": "BOOLEAN DEFAULT FALSE",
+                  # العروض الموجودة قبل الميزة تُعتبر مُعلنة، حتى لا تصل للمتابعين كأنها جديدة
+                  "followers_notified": "BOOLEAN DEFAULT TRUE"},
         "click_events": {"source": "VARCHAR(20) DEFAULT 'direct'"},
+        "shops": {"code_offer": "VARCHAR(80) DEFAULT ''", "reported_on": "DATE"},
     }
     insp = inspect(engine)
     with engine.begin() as conn:
@@ -611,27 +656,38 @@ def telegram_call(method: str, payload: dict) -> bool:
         return False
 
 
+def deal_caption(deal: "Deal", base: str, src: str) -> str:
+    return "\n".join([
+        f"🔥 {deal.shop_name}",
+        deal.title,
+        "",
+        f"💰 {deal.new_price:,} د.ع بدل {deal.old_price:,} (خصم {deal.discount_percent}%)",
+        f"📍 {deal.area}",
+        "",
+        f"👈 اطلب العرض: {base}/deal/{deal.id}?src={src}",
+    ])
+
+
 def announce_deal(deal_id: int, base: str) -> None:
-    """ينشر العرض في قناة تيليغرام مرة واحدة فقط (يعمل في الخلفية بعد الموافقة)."""
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL):
+    """عند نشر عرض: يُنشر في القناة مرة واحدة، ويصل لمتابعي المحل مرة واحدة (في الخلفية)."""
+    if not TELEGRAM_BOT_TOKEN:
         return
     with SessionLocal() as db:
         deal = db.get(Deal, deal_id)
-        if not deal or not deal.is_approved or deal.tg_posted or not live(deal):
+        if not deal or not deal.is_approved or not live(deal):
             return
-        caption = "\n".join([
-            f"🔥 {deal.shop_name}",
-            deal.title,
-            "",
-            f"💰 {deal.new_price:,} د.ع بدل {deal.old_price:,} (خصم {deal.discount_percent}%)",
-            f"📍 {deal.area}",
-            "",
-            f"👈 اطلب العرض: {base}/deal/{deal.id}?src=telegram",
-        ])
-        if telegram_call("sendPhoto", {"chat_id": TELEGRAM_CHANNEL, "photo": base + deal.image_url,
-                                       "caption": caption}):
-            deal.tg_posted = True
+        if TELEGRAM_CHANNEL and not deal.tg_posted:
+            if telegram_call("sendPhoto", {"chat_id": TELEGRAM_CHANNEL, "photo": base + deal.image_url,
+                                           "caption": deal_caption(deal, base, "telegram")}):
+                deal.tg_posted = True
+                db.commit()
+        if deal.shop_id and not deal.followers_notified:
+            deal.followers_notified = True  # نعلّمه أولاً: لا نرسل مرتين حتى لو تكرر الاستدعاء
             db.commit()
+            chats = db.scalars(select(ShopFollower.chat_id).where(ShopFollower.shop_id == deal.shop_id)).all()
+            caption = "🔔 عرض جديد من محل تتابعه\n\n" + deal_caption(deal, base, "follow")
+            for chat in chats:
+                telegram_call("sendPhoto", {"chat_id": chat, "photo": base + deal.image_url, "caption": caption})
 
 
 def notify_admin(deal_id: int, base: str) -> None:
@@ -649,6 +705,16 @@ def notify_admin(deal_id: int, base: str) -> None:
 
 def site_base(request: Request) -> str:
     return str(request.base_url).rstrip("/")
+
+
+def channel_url() -> str:
+    """رابط القناة العامة للزوار: من TELEGRAM_CHANNEL_URL، أو يُشتق من اسم القناة إن كان @اسم."""
+    explicit = os.getenv("TELEGRAM_CHANNEL_URL", "")
+    if explicit.startswith("https://"):
+        return explicit
+    if re.fullmatch(r"@[A-Za-z0-9_]{4,64}", TELEGRAM_CHANNEL):
+        return f"https://t.me/{TELEGRAM_CHANNEL[1:]}"
+    return ""
 
 
 def tg_send(chat_id: str, text: str, **extra) -> bool:
@@ -740,6 +806,36 @@ def make_reset_link(db: Session, shop: "Shop", base: str) -> str:
     shop.reset_expires = utcnow() + timedelta(minutes=RESET_MINUTES)
     db.commit()
     return f"{base}/shop/reset/{token}"
+
+
+def run_weekly_reports() -> int:
+    """تقرير أسبوعي لكل محل على تيليغرام: يذكّره كل أسبوع بما يجلبه له اشتراكه."""
+    sent = 0
+    week_ago = utcnow() - timedelta(days=7)
+    with SessionLocal() as db:
+        shops = db.scalars(select(Shop).where(Shop.verified.is_(True), Shop.tg_chat_id != "")).all()
+        for shop in shops:
+            if shop.reported_on and (today() - shop.reported_on).days < 7:
+                continue
+            ids = list(db.scalars(select(Deal.id).where(Deal.shop_id == shop.id)).all())
+            if not ids or shop.created_at > week_ago:
+                continue  # لا تقرير لمحل بلا عروض أو سجّل قبل أقل من أسبوع
+            clicks = db.scalar(select(func.count()).select_from(ClickEvent)
+                               .where(ClickEvent.deal_id.in_(ids), ClickEvent.created_at >= week_ago))
+            views = sum(views_since(db, 7, ids).values())
+            followers = db.scalar(select(func.count()).select_from(ShopFollower).where(ShopFollower.shop_id == shop.id))
+            sales = code_sales_since(db, shop.id, 7)
+            lines = [f"📊 تقرير {shop.name} الأسبوعي على {SITE_NAME}", "",
+                     f"👁 {views:,} مشاهدة لعروضك", f"👆 {clicks:,} شخص ضغط «اطلب العرض»",
+                     f"🔔 {followers:,} متابع لمحلك"]
+            if shop.code_offer:
+                lines.append(f"🎟 {sales:,} زبون قال كود {shop.code}")
+            lines += ["", f"عروضك وإحصائياتها: {PUBLIC_URL}/shop"]
+            if tg_send(shop.tg_chat_id, "\n".join(lines)):
+                shop.reported_on = today()
+                sent += 1
+        db.commit()
+    return sent
 
 
 def run_reminders() -> int:
@@ -856,6 +952,7 @@ select option{background:#15151c;color:#f1f5f9}
 <footer class="text-center text-xs text-slate-400 pb-8 space-y-2">
   <nav class="flex flex-wrap justify-center gap-x-4 gap-y-1 font-bold" aria-label="روابط الموقع">
     <a href="/join" class="underline">للمحلات والبيجات</a>
+    <a href="/tip" class="underline">بلّغ عن لقطة</a>
     <a href="/about" class="underline">من نحن</a>
     <a href="/terms" class="underline">الشروط والخصوصية</a>
     {% if contact_wa %}<a href="https://wa.me/{{ contact_wa }}" target="_blank" rel="noopener" class="underline">تواصل واتساب</a>{% endif %}
@@ -933,6 +1030,11 @@ document.addEventListener('click',function(e){
     </div>
     {% endfor %}
   </dl>
+  {% endif %}
+  {% if channel_url %}
+  <a href="{{ channel_url }}" target="_blank" rel="noopener"
+     class="mt-4 inline-flex items-center gap-2 rounded-full border border-sky-400/40 bg-sky-400/10 text-sky-200 text-sm font-bold px-5 py-2 active:scale-95 transition">
+    📢 تابع «لقطة اليوم» على تيليغرام</a>
   {% endif %}
 </section>
 
@@ -1162,6 +1264,12 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
     <p class="mt-2 self-start text-sm font-bold text-emerald-300 bg-emerald-400/10 rounded-md px-2 py-1">وفّر {{ deal.savings | price }} د.ع</p>
     {% if deal.ends_soon %}<p class="mt-2 text-sm font-extrabold text-amber-300">⏳ ينتهي {{ deal.ends_text }}</p>{% endif %}
     {% if deal.clicks_count >= 5 %}<p class="mt-2 text-xs text-slate-400">👥 {{ deal.clicks_count | price }} شخص طلبوا هذا العرض</p>{% endif %}
+    {% if owner_shop and owner_shop.code_offer %}
+    <div class="mt-3 rounded-2xl border border-dashed border-amber-400/60 bg-amber-400/10 p-3">
+      <p class="text-sm font-extrabold text-amber-200">🎟 كود لقطة: <span dir="ltr" class="select-all tracking-wider">{{ owner_shop.code }}</span></p>
+      <p class="text-xs text-amber-100/80 mt-1">قل الكود عند الطلب وتحصل على: {{ owner_shop.code_offer }}</p>
+    </div>
+    {% endif %}
     <div class="mt-5 md:mt-auto flex gap-2">
       <a href="/go/{{ deal.id }}" target="_blank" rel="nofollow noopener"
          class="flex-1 text-center text-base font-extrabold rounded-full py-3.5 active:scale-95 transition
@@ -1169,6 +1277,11 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
       <button type="button" data-url="/deal/{{ deal.id }}" data-share="{{ deal.shop_name }} — {{ deal.title }} بـ {{ deal.new_price | price }} د.ع بدل {{ deal.old_price | price }} 🔥"
               class="shrink-0 px-5 rounded-full border border-white/20 text-sm font-bold text-slate-200 active:scale-95 transition">مشاركة</button>
     </div>
+    {% if follow_url %}
+    <a href="{{ follow_url }}" target="_blank" rel="noopener"
+       class="mt-3 flex items-center justify-center gap-2 rounded-full border border-sky-400/40 bg-sky-400/10 text-sky-200 text-sm font-bold py-2.5 active:scale-95 transition">
+      🔔 تابع {{ deal.shop_name }} — يوصلك عرضه الجديد على تيليغرام</a>
+    {% endif %}
   </div>
 </article>
 
@@ -1408,6 +1521,27 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   {% endfor %}
 </section>
 <p class="mt-2 text-xs text-slate-500">النقرة = شخص ضغط «اطلب العرض» وتحوّل لصفحتك. كل شخص يُحسب مرة واحدة.</p>
+<p class="mt-1 text-xs text-sky-300">🔔 {{ stats.followers | price }} متابع لمحلك — يصلهم كل عرض جديد تنشره على تيليغرام.</p>
+
+<details class="mt-4 rounded-2xl glass p-4" {{ 'open' if not shop.code_offer }}>
+  <summary class="font-extrabold cursor-pointer">🎟 كود لقطة: <span dir="ltr" class="text-amber-300">{{ shop.code }}</span>
+    <span class="text-xs font-medium text-slate-400">— {{ code_sales_30d }} زبون قال الكود خلال 30 يوم</span></summary>
+  <p class="mt-2 text-xs text-slate-400 leading-relaxed">أعطِ ميزة صغيرة لمن يقول الكود (خصم إضافي، هدية، توصيل مجاني). يظهر الكود في صفحة عرضك،
+    ويُكتب تلقائياً في رسالة الواتساب التي تصلك من الزبون. هكذا تعرف بالضبط كم زبوناً جاءك من لقطة.</p>
+  <form method="post" action="/shop/code" class="mt-3 flex gap-2">
+    <input name="code_offer" value="{{ shop.code_offer }}" maxlength="80" placeholder="مثال: خصم 5% إضافي"
+           class="flex-1 min-w-0 rounded-xl border border-white/15 bg-white/5 text-white placeholder-slate-500 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-rose-500">
+    <button class="shrink-0 bg-white text-slate-900 text-sm font-bold rounded-full px-4">حفظ</button>
+  </form>
+  {% if shop.code_offer %}
+  <form method="post" action="/shop/code/sales" class="mt-3 flex items-center gap-2 text-sm">
+    <span class="text-slate-300">زبائن قالوا الكود اليوم:</span>
+    <input type="number" name="count" min="1" max="200" value="1" required
+           class="w-20 rounded-xl border border-white/15 bg-white/5 text-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-rose-500">
+    <button class="bg-emerald-500 text-white text-sm font-bold rounded-full px-4 py-2">+ سجّل</button>
+  </form>
+  {% endif %}
+</details>
 
 <div class="mt-6 flex items-center justify-between">
   <h2 class="text-lg font-extrabold">عروضي <span class="text-sm font-medium text-slate-400">({{ deals | length }} من {{ shop.deal_limit }})</span></h2>
@@ -1533,6 +1667,26 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   </div>
 </div>
 {% endblock %}""",
+    "tip.html": """{% extends "base.html" %}
+{% block title %}بلّغ عن لقطة — {{ site_name }}{% endblock %}
+{% set inp = "w-full rounded-xl border border-white/15 bg-white/5 text-white placeholder-slate-500 px-3 py-2.5 text-base focus:outline-none focus:ring-2 focus:ring-rose-500" %}
+{% block content %}
+<div class="max-w-md mx-auto pt-8">
+  <h1 class="text-2xl font-extrabold">💡 بلّغ عن لقطة</h1>
+  <p class="mt-2 text-sm text-slate-400">شفت عرضاً حلواً بمحل مو موجود على {{ site_name }}؟ دلّنا عليه ونحاول نضيفه، حتى يستفيد الكل.</p>
+  {% if error %}<p class="mt-4 bg-rose-50 border border-rose-200 text-rose-700 text-sm rounded-xl p-3">{{ error }}</p>{% endif %}
+  <form method="post" action="/tip" class="mt-5 space-y-4">
+    <label class="block"><span class="text-sm font-bold">اسم المحل أو البيج</span>
+      <input name="shop_name" value="{{ form.shop_name }}" required maxlength="80" class="{{ inp }} mt-1"></label>
+    <label class="block"><span class="text-sm font-bold">وين نلگاه؟</span>
+      <input name="where" value="{{ form.where }}" required maxlength="300" placeholder="رابط الإنستغرام، أو الرقم، أو المنطقة" class="{{ inp }} mt-1"></label>
+    <label class="block"><span class="text-sm font-bold">شنو العرض؟ <span class="font-normal text-slate-400">(اختياري)</span></span>
+      <textarea name="note" maxlength="300" rows="3" class="{{ inp }} mt-1">{{ form.note }}</textarea></label>
+    <div class="hidden" aria-hidden="true"><input name="website" tabindex="-1" autocomplete="off"></div>
+    <button class="w-full bg-gradient-to-l from-rose-600 to-orange-500 text-white font-extrabold rounded-full py-3 active:scale-95 transition">أرسل</button>
+  </form>
+</div>
+{% endblock %}""",
     "admin_login.html": """{% extends "base.html" %}
 {% block title %}دخول الإدارة — {{ site_name }}{% endblock %}
 {% block content %}
@@ -1594,6 +1748,22 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   <p class="text-xs text-slate-400 mt-3">حتى يُحسب المصدر بدقة، أضف لرابط الموقع في كل منصة النهاية الخاصة بها:</p>
   <p dir="ltr" class="text-xs text-slate-500 font-mono text-left mt-1 leading-relaxed">/?src=instagram<br>/?src=tiktok<br>/?src=telegram</p>
 </section>
+
+{% if tips %}
+<details class="mt-3 bg-sky-50 rounded-2xl border border-sky-200 p-4" open>
+  <summary class="font-extrabold cursor-pointer">💡 محلات اقترحها الزوار <span class="text-xs font-medium text-slate-500">({{ tips | length }})</span></summary>
+  <p class="text-xs text-slate-500 mt-1">راسل المحل وقل له: «زبائن طلبوا عروضكم على {{ site_name }}» — هذه أقوى رسالة لجلب محل جديد.</p>
+  {% for t in tips %}
+  <div class="mt-3 bg-white rounded-xl border border-sky-100 p-3 text-sm">
+    <p class="font-extrabold">{{ t.shop_name }}</p>
+    <p class="text-xs text-slate-600 break-all" dir="auto">{{ t.where }}</p>
+    {% if t.note %}<p class="text-xs text-slate-500 mt-1">{{ t.note }}</p>{% endif %}
+    <form method="post" action="/admin/tips/{{ t.id }}/done" class="mt-2">
+      <button class="{{ btn }} border-slate-300 text-slate-700">✓ تم التعامل معه</button></form>
+  </div>
+  {% endfor %}
+</details>
+{% endif %}
 
 {% if payments %}
 <section class="mt-3 bg-amber-50 rounded-2xl border border-amber-300 p-4">
@@ -1788,6 +1958,7 @@ def render(name: str, status_code: int = 200, **ctx) -> HTMLResponse:
     ctx.setdefault("basic_price", BASIC_PRICE)
     ctx.setdefault("vip_price", VIP_PRICE)
     ctx.setdefault("citywide", CITYWIDE)
+    ctx.setdefault("channel_url", channel_url())
     return HTMLResponse(jinja.get_template(name).render(**ctx), status_code=status_code)
 
 
@@ -1847,9 +2018,55 @@ def _http_error(request: Request, exc: StarletteHTTPException):
     return HTMLResponse(str(exc.detail), status_code=exc.status_code)
 
 
+@app.exception_handler(Exception)
+def _server_error(request: Request, exc: Exception):
+    """أي خطأ غير متوقع: صفحة مهذبة للزائر، وتنبيه فوري لك على تيليغرام."""
+    print(f"[error] {request.method} {request.url.path}: {type(exc).__name__}: {exc}")
+    alert_error(f"{request.method} {request.url.path}", exc)
+    return render("message.html", 500, emoji="🛠️", heading="حدث خطأ مؤقت",
+                  body="وصلنا تنبيه بالمشكلة ونعمل عليها. جرّب بعد قليل.")
+
+
 @app.api_route("/healthz", methods=["GET", "HEAD"])
 def healthz():
     return {"ok": True}
+
+
+# ── «بلّغ عن لقطة»: المشترون يقترحون عروض محلات غير مسجّلة ──
+
+@app.get("/tip", response_class=HTMLResponse)
+def tip_page():
+    return render("tip.html", form={"shop_name": "", "where": "", "note": ""}, error="")
+
+
+@app.post("/tip", response_class=HTMLResponse)
+def tip_submit(request: Request, background: BackgroundTasks, shop_name: str = Form(""), where: str = Form(""),
+               note: str = Form(""), website: str = Form(""), db: Session = Depends(get_db)):
+    form = {"shop_name": shop_name, "where": where, "note": note}
+    thanks = dict(emoji="🙏", heading="شكراً لك!", body="وصلنا اقتراحك، وسنحاول نضيف عروض هذا المحل قريباً.")
+    if website:
+        return render("message.html", **thanks)
+    rate_key = f"tip:{client_ip(request)}"
+    if too_many(rate_key, limit=5, window=3600):
+        return render("tip.html", 429, form=form, error="أرسلت اقتراحات كثيرة — حاول بعد ساعة.")
+    shop_name, where, note = (" ".join(x.split()) for x in (shop_name, where, note))
+    if len(shop_name) < 2 or len(where) < 3:
+        return render("tip.html", 400, form=form, error="اكتب اسم المحل، ورابط صفحته أو رقمه أو مكانه.")
+    db.add(DealTip(shop_name=shop_name[:80], where=where[:300], note=note[:300]))
+    db.commit()
+    record_hit(rate_key)
+    background.add_task(tg_admin, f"💡 اقتراح محل جديد من زائر\n{shop_name[:80]}\n{where[:300]}"
+                                  + (f"\n{note[:300]}" if note else "") + f"\n\n{site_base(request)}/admin")
+    return render("message.html", **thanks)
+
+
+@app.post("/admin/tips/{tip_id}/done", dependencies=[Depends(require_admin)])
+def admin_tip_done(tip_id: DealId, db: Session = Depends(get_db)):
+    tip = db.get(DealTip, tip_id)
+    if tip:
+        db.delete(tip)
+        db.commit()
+    return RedirectResponse("/admin", status_code=303)
 
 
 # ── صفحات ثابتة: للمحلات، من نحن، الشروط ──
@@ -2006,11 +2223,27 @@ def deal_page(deal_id: DealId, request: Request, db: Session = Depends(get_db)):
     base = str(request.base_url).rstrip("/")
     resp = render("deal.html", deal=deal, similar=similar,
                   og_image=base + deal.image_url, og_url=f"{base}/deal/{deal.id}",
-                  jsonld=deal_jsonld(deal, base))
+                  jsonld=deal_jsonld(deal, base),
+                  follow_url=bot_url(f"f{deal.shop_id}") if deal.shop_id else "",
+                  owner_shop=db.get(Shop, deal.shop_id) if deal.shop_id else None)
     track_visit(request, resp, db)
     if not (admin or owner):
         count_view(request, resp, db, deal.id)
     return resp
+
+
+def order_link(db: Session, deal: "Deal") -> str:
+    """رابط الطلب. لواتساب نكتب للزبون رسالة جاهزة تذكر لقطة (والكود إن وُجد عرض للكود):
+    هكذا يرى صاحب المحل في محادثاته بعينه أن الزبون جاء من لقطة."""
+    url = deal.link_url
+    parsed = urlparse(url)
+    if parsed.netloc.lower() not in ("wa.me", "api.whatsapp.com") or "text=" in parsed.query:
+        return url
+    shop = db.get(Shop, deal.shop_id) if deal.shop_id else None
+    msg = f"مرحبا، شفت عرضكم «{deal.title}» على {SITE_NAME} بسعر {deal.new_price:,} د.ع."
+    if shop and shop.code_offer:
+        msg += f"\nكود {SITE_NAME}: {shop.code}"
+    return url + ("&" if parsed.query else "?") + urlencode({"text": msg})
 
 
 def count_view(request: Request, response, db: Session, deal_id: int) -> None:
@@ -2049,7 +2282,7 @@ def go(deal_id: DealId, request: Request, db: Session = Depends(get_db)):
 
     # لا نحسب نقرات الأدمن ولا روبوتات المعاينة حتى تبقى الإحصائية صادقة أمام المحل
     # ولا نحسب ضغط الزائر نفسه على العرض نفسه أكثر من مرة خلال 6 ساعات
-    resp = RedirectResponse(deal.link_url, status_code=302, headers={"Cache-Control": "no-store"})
+    resp = RedirectResponse(order_link(db, deal), status_code=302, headers={"Cache-Control": "no-store"})
     is_bot = bool(BOT_RE.search(request.headers.get("user-agent", "")))
     clicked = [c for c in request.cookies.get(CLICKED_COOKIE, "").split(".") if c.isascii() and c.isdigit()]
     if not is_bot and not is_admin(request) and str(deal_id) not in clicked:
@@ -2318,11 +2551,15 @@ def shop_home(request: Request, ok: str = "", shop: Shop = Depends(require_shop)
     stats = dict(d7=sum(clicks_since(7).values()), d30=sum(clicks_30d.values()),
                  total=sum(d.clicks_count for d in deals))
     pending_payment = db.scalar(select(Payment).where(Payment.shop_id == shop.id, Payment.status == "pending"))
+    stats["followers"] = db.scalar(select(func.count()).select_from(ShopFollower).where(ShopFollower.shop_id == shop.id))
+    code_sales_30d = code_sales_since(db, shop.id, 30)
     notice = {"deal": "تم حفظ العرض.", "pending": "وصلنا عرضك وسيُنشر بعد مراجعة سريعة.",
               "deleted": "تم حذف العرض.", "paid": "وصلتنا تفاصيل دفعتك وسنؤكدها قريباً.",
               "paused": "تم إيقاف العرض مؤقتاً. لا يظهر للزوار حتى تشغّله.",
-              "resumed": "عاد العرض للظهور."}.get(ok, "")
+              "resumed": "عاد العرض للظهور.", "code": "تم حفظ ميزة الكود.",
+              "sales": "تم تسجيل الزبائن. ✓"}.get(ok, "")
     resp = render("shop_home.html", shop=shop, deals=deals, clicks_30d=clicks_30d, stats=stats, views_30d=views_30d,
+                  code_sales_30d=code_sales_30d,
                   pending_payment=pending_payment, notice=notice, today=today(),
                   vip_limit=PLAN_LIMITS["vip"], bot_url=bot_url(),
                   verify_url=bot_url("v" + shop.verify_code) if shop.verify_code else "")
@@ -2447,6 +2684,27 @@ def shop_deal_edit(
     return RedirectResponse("/shop?ok=pending", status_code=303)
 
 
+def code_sales_since(db: Session, shop_id: int, days: int) -> int:
+    return int(db.scalar(select(func.coalesce(func.sum(CodeSale.count), 0))
+                         .where(CodeSale.shop_id == shop_id, CodeSale.day >= today() - timedelta(days=days))))
+
+
+@app.post("/shop/code")
+def shop_code(code_offer: str = Form(""), shop: Shop = Depends(require_shop), db: Session = Depends(get_db)):
+    shop.code_offer = " ".join(code_offer.split())[:80]
+    db.commit()
+    return RedirectResponse("/shop?ok=code", status_code=303)
+
+
+@app.post("/shop/code/sales")
+def shop_code_sales(count: int = Form(1), shop: Shop = Depends(require_shop), db: Session = Depends(get_db)):
+    if not 1 <= count <= 200:
+        return RedirectResponse("/shop", status_code=303)
+    db.add(CodeSale(shop_id=shop.id, count=count, day=today()))
+    db.commit()
+    return RedirectResponse("/shop?ok=sales", status_code=303)
+
+
 @app.post("/shop/deals/{deal_id}/pause")
 def shop_deal_pause(deal_id: DealId, shop: Shop = Depends(require_shop), db: Session = Depends(get_db)):
     """إيقاف مؤقت (نفدت الكمية، المحل مغلق...) بدون حذف العرض ولا خسارة إحصائياته."""
@@ -2540,7 +2798,18 @@ def tg_webhook(secret: str, update_: dict = Body(...), db: Session = Depends(get
         shop = None
         if arg.startswith("v") and len(arg) > 1:
             shop = db.scalar(select(Shop).where(Shop.verify_code == arg[1:]))
-        if shop and shop.verified:
+        followed = None
+        if arg.startswith("f") and arg[1:].isdigit() and len(arg) < 12:
+            followed = db.get(Shop, int(arg[1:]))
+        if followed:
+            # مشترٍ ضغط «تابع المحل»: يصله كل عرض جديد من هذا المحل
+            if not db.scalar(select(ShopFollower.id).where(ShopFollower.shop_id == followed.id,
+                                                          ShopFollower.chat_id == chat_id)):
+                db.add(ShopFollower(shop_id=followed.id, chat_id=chat_id))
+                db.commit()
+            tg_send(chat_id, f"🔔 صرت تتابع «{followed.name}» على {SITE_NAME}.\n"
+                             f"يصلك هنا كل عرض جديد ينزله.\n\nلإلغاء كل المتابعات أرسل /stop")
+        elif shop and shop.verified:
             # حساب أكّدته الإدارة يدوياً: نربطه بتيليغرام لتصله الإشعارات. الرمز يظهر في بوابته فقط.
             shop.tg_chat_id, shop.verify_code = chat_id, ""
             db.commit()
@@ -2555,7 +2824,13 @@ def tg_webhook(secret: str, update_: dict = Body(...), db: Session = Depends(get
             if known:
                 tg_send(chat_id, f"أهلاً {known.name} 👋 حسابك مؤكد.\nبوابتك: {base}/shop")
             else:
-                tg_send(chat_id, f"أهلاً بك في {SITE_NAME} 👋\nلتسجيل محلك ونشر عروضك: {base}/shop/register")
+                tg_send(chat_id, f"أهلاً بك في {SITE_NAME} 👋\nكل عروض الموصل: {base}\n\n"
+                                 f"عندك محل؟ سجّله وانشر عروضك: {base}/shop/register")
+    elif text_ == "/stop":
+        n = db.execute(delete(ShopFollower).where(ShopFollower.chat_id == chat_id)).rowcount
+        db.commit()
+        tg_send(chat_id, "تم إلغاء كل متابعاتك. ما راح توصلك عروض بعد الآن." if n
+                else "ما عندك متابعات حالياً.")
     elif contact:
         shop = db.scalar(select(Shop).where(Shop.tg_chat_id == chat_id, Shop.verified.is_(False))
                          .order_by(Shop.id.desc()))
@@ -2594,13 +2869,105 @@ def setup_telegram() -> None:
         print(f"[telegram] setup failed: {type(e).__name__}")
 
 
+def tg_send_document(chat_id: str, filename: str, data: bytes, caption: str = "") -> bool:
+    """يرسل ملفاً لمحادثة تيليغرام (حدّ تيليغرام 50 ميغابايت)."""
+    if not (TELEGRAM_BOT_TOKEN and chat_id) or len(data) > 49 * 1024 * 1024:
+        return False
+    boundary = secrets.token_hex(16)
+    parts = []
+    for name, value in (("chat_id", chat_id), ("caption", caption)):
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+                 f"Content-Type: application/octet-stream\r\n\r\n".encode() + data + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument", data=b"".join(parts),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return bool(json.load(resp).get("ok"))
+    except Exception as e:
+        print(f"[telegram] sendDocument failed: {type(e).__name__}")
+        return False
+
+
+def build_backup() -> tuple[str, bytes]:
+    """نسخة مضغوطة من قاعدة البيانات (SQLite) ومن الصور إن كان حجمها يسمح بالإرسال."""
+    import io as _io
+    import sqlite3
+    import tarfile
+    import tempfile
+    stamp = (utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d")
+    buf = _io.BytesIO()
+    with tempfile.TemporaryDirectory() as tmp, tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        db_file = DATA_DIR / "deals.db"
+        if DATABASE_URL.startswith("sqlite") and db_file.exists():
+            copy = Path(tmp) / "deals.db"
+            src, dst = sqlite3.connect(db_file), sqlite3.connect(copy)
+            with dst:
+                src.backup(dst)  # نسخة متسقة حتى أثناء الكتابة
+            src.close(); dst.close()
+            tar.add(copy, arcname="deals.db")
+        uploads_size = sum(f.stat().st_size for f in UPLOAD_DIR.glob("*") if f.is_file())
+        if uploads_size < 40 * 1024 * 1024:  # الصور WebP مضغوطة أصلاً: نضمّها ما دام الحجم يسمح
+            tar.add(UPLOAD_DIR, arcname="uploads")
+            tar.add(PROOF_DIR, arcname="proofs")
+    return f"lagta-backup-{stamp}.tar.gz", buf.getvalue()
+
+
+def run_daily_backup() -> bool:
+    """يرسل نسخة احتياطية إلى تيليغرام المدير: نسخة خارج Render لا تضيع إن ضاع الخادم."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_CHAT):
+        return False
+    name, data = build_backup()
+    with SessionLocal() as db:
+        deals = db.scalar(select(func.count()).select_from(Deal))
+        shops = db.scalar(select(func.count()).select_from(Shop))
+    caption = (f"🗄 نسخة احتياطية يومية — {deals} عرض، {shops} محل، {len(data) // 1024:,} KB.\n"
+               f"احتفظ بها: تكفي لاسترجاع الموقع كاملاً.")
+    return tg_send_document(TELEGRAM_ADMIN_CHAT, name, data, caption)
+
+
+_last_error_alert: dict[str, float] = {}
+
+
+def alert_error(where: str, exc: BaseException) -> None:
+    """ينبّه المدير على تيليغرام بخطأ في الخادم، مرة واحدة لكل نوع خطأ كل 30 دقيقة."""
+    key = f"{where}:{type(exc).__name__}"
+    now = time.time()
+    if now - _last_error_alert.get(key, 0) < 1800:
+        return
+    _last_error_alert[key] = now
+    text = f"⚠️ خطأ في الموقع\n{where}\n{type(exc).__name__}: {str(exc)[:300]}"
+    threading.Thread(target=tg_admin, args=(text,), daemon=True).start()
+
+
 def _background_loop() -> None:
     setup_telegram()
+    last_backup_day = None
     while True:
         try:
             run_reminders()
         except Exception as e:
             print(f"[reminders] failed: {type(e).__name__}")
+            alert_error("التذكيرات التلقائية", e)
+        # التقرير الأسبوعي صباح الجمعة بتوقيت العراق
+        local_now = utcnow() + timedelta(hours=3)
+        if local_now.weekday() == 4 and 9 <= local_now.hour < 21:
+            try:
+                run_weekly_reports()
+            except Exception as e:
+                print(f"[weekly] failed: {type(e).__name__}")
+                alert_error("التقرير الأسبوعي", e)
+        # النسخة الاحتياطية مرة يومياً، بعد الثالثة فجراً بتوقيت العراق
+        local = utcnow() + timedelta(hours=3)
+        if local.hour >= 3 and last_backup_day != local.date():
+            try:
+                if run_daily_backup():
+                    last_backup_day = local.date()
+            except Exception as e:
+                print(f"[backup] failed: {type(e).__name__}")
+                alert_error("النسخ الاحتياطي اليومي", e)
         time.sleep(3600)
 
 
@@ -2694,6 +3061,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                   trial_days=TRIAL_DAYS, grace_days=GRACE_DAYS,
                   shops=shops, payments=payments, deal_counts=deal_counts, plan_names=PLAN_NAMES,
                   views_30d=views_30d,
+                  tips=db.scalars(select(DealTip).order_by(DealTip.created_at.desc()).limit(50)).all(),
                   bot_ready=bool(bot_url()),
                   goal_percent=min(100, stats["mrr"] * 100 // MONTHLY_GOAL))
 
@@ -2822,6 +3190,8 @@ def admin_shop_delete(shop_id: ShopId, db: Session = Depends(get_db)):
     if deals:
         db.execute(delete(ClickEvent).where(ClickEvent.deal_id.in_([d.id for d in deals])))
         db.execute(delete(DealView).where(DealView.deal_id.in_([d.id for d in deals])))
+    db.execute(delete(ShopFollower).where(ShopFollower.shop_id == shop.id))
+    db.execute(delete(CodeSale).where(CodeSale.shop_id == shop.id))
     for row in [*deals, *payments, shop]:
         db.delete(row)
     db.commit()

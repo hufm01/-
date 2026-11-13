@@ -59,7 +59,8 @@ r = pub.get("/uploads/" + img)
 check("image served, resized webp", r.status_code == 200 and max(Image.open(io.BytesIO(r.content)).size) == 1200)
 
 r = pub.get("/go/1")
-check("go redirects to whatsapp", r.status_code == 302 and r.headers["location"] == "https://wa.me/9647701234567")
+check("go redirects to whatsapp with a ready message", r.status_code == 302
+      and r.headers["location"].startswith("https://wa.me/9647701234567?text="))
 pub.get("/go/1"); pub.get("/go/1")  # same visitor again: must not count
 TestClient(main.app, follow_redirects=False).get("/go/1")  # a different visitor: counts
 pub.get("/go/1", headers={"user-agent": "facebookexternalhit/1.1"}); adm.get("/go/1")

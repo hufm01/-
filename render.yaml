@@ -20,6 +20,8 @@ services:
         sync: false
       - key: TELEGRAM_CHANNEL      # اختياري: اسم القناة مثل @lagta_mosul (البوت مشرف فيها)
         sync: false
+      - key: TELEGRAM_CHANNEL_URL  # اختياري: رابط الانضمام للقناة إن كانت خاصة (https://t.me/+...)
+        sync: false
       - key: TELEGRAM_ADMIN_CHAT   # اختياري: رقم محادثتك مع البوت لتصلك تنبيهات العروض الجديدة
         sync: false
       - key: SECRET_KEY            # اختياري
