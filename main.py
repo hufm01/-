@@ -22,6 +22,7 @@ import json
 import os
 import re
 import secrets
+import threading
 import time
 import urllib.request
 import uuid
@@ -31,11 +32,12 @@ from pathlib import Path
 from typing import Annotated, Optional
 from urllib.parse import urlencode, urlparse
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import (BackgroundTasks, Body, Depends, FastAPI, File, Form, HTTPException, Request,
+                     UploadFile)
 from fastapi import Path as PathParam
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from jinja2 import DictLoader, Environment, select_autoescape
 from PIL import Image, ImageOps
@@ -72,6 +74,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+PROOF_DIR = DATA_DIR / "proofs"  # إيصالات الدفع: خاصة، لا تُعرض إلا للمدير
+PROOF_DIR.mkdir(parents=True, exist_ok=True)
 
 DATABASE_URL = os.getenv("DATABASE_URL") or f"sqlite:///{(DATA_DIR / 'deals.db').as_posix()}"
 if DATABASE_URL.startswith("postgres://"):  # صيغة Render/Railway القديمة
@@ -112,6 +116,17 @@ GRACE_DAYS = 3    # مهلة بعد انتهاء المدة قبل أن يُخف
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")        # مثل @lagta_mosul
 TELEGRAM_ADMIN_CHAT = os.getenv("TELEGRAM_ADMIN_CHAT", "")  # رقم محادثتك مع البوت
+BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "").lstrip("@")  # يُجلب تلقائياً عند التشغيل إن لم يُضبط
+# رابط الموقع العام: يلزم لتسجيل البوت وروابط الرسائل. Render يضبط RENDER_EXTERNAL_URL تلقائياً.
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+WEBHOOK_SECRET = hmac.new(SECRET_KEY, b"tg-webhook:" + TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256).hexdigest()[:40]
+
+# بوابة المحلات
+PLAN_LIMITS = {"basic": 1, "vip": 3}   # عدد العروض المسموح لكل باقة
+PLAN_NAMES = {"basic": "الأساسية", "vip": "VIP"}
+SHOP_COOKIE = "shop_session"
+SHOP_SESSION_DAYS = 30
+RESET_MINUTES = 30
 ZAINCASH_NUMBER = os.getenv("ZAINCASH_NUMBER", "")  # يظهر في رسالة الإحصائيات الجاهزة
 CONTACT_WHATSAPP = os.getenv("CONTACT_WHATSAPP", "")  # رقم واتساب عام للتواصل (يظهر للزوار إن ضُبط)
 
@@ -176,6 +191,7 @@ class Deal(Base):
     ends_on: Mapped[Optional[date]] = mapped_column(Date, nullable=True)  # آخر يوم لصلاحية العرض نفسه
     trial_until: Mapped[Optional[date]] = mapped_column(Date, nullable=True)  # نهاية الشهر المجاني
     tg_posted: Mapped[bool] = mapped_column(Boolean, default=False)  # نُشر في قناة تيليغرام
+    shop_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)  # صاحبه في البوابة
 
     @property
     def active_until(self) -> Optional[date]:
@@ -252,6 +268,67 @@ class Visit(Base):
     count: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class Shop(Base):
+    """حساب صاحب المحل في بوابة المحلات. الاشتراك يُدار هنا ويُنسخ إلى عروض المحل."""
+
+    __tablename__ = "shops"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(80))
+    phone: Mapped[str] = mapped_column(String(20), unique=True, index=True)  # بالصيغة الدولية 9647…
+    password_hash: Mapped[str] = mapped_column(String(200))
+    verified: Mapped[bool] = mapped_column(Boolean, default=False)     # أكّد ملكية الرقم
+    verify_code: Mapped[str] = mapped_column(String(16), default="", index=True)
+    tg_chat_id: Mapped[str] = mapped_column(String(32), default="", index=True)
+    trusted: Mapped[bool] = mapped_column(Boolean, default=False)      # قُبل أول عرض له: ينشر مباشرة
+    is_vip: Mapped[bool] = mapped_column(Boolean, default=False)
+    trial_until: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    paid_until: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    reset_hash: Mapped[str] = mapped_column(String(64), default="")
+    reset_expires: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    reminded_on: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    @property
+    def active_until(self) -> Optional[date]:
+        return self.paid_until or self.trial_until
+
+    @property
+    def days_left(self) -> Optional[int]:
+        return (self.active_until - today()).days if self.active_until else None
+
+    @property
+    def is_paid(self) -> bool:
+        return self.paid_until is not None and self.paid_until >= today()
+
+    @property
+    def deal_limit(self) -> int:
+        return PLAN_LIMITS["vip" if self.is_vip and self.is_paid else "basic"]
+
+    @property
+    def monthly_fee(self) -> int:
+        return VIP_PRICE if self.is_vip else BASIC_PRICE
+
+    @property
+    def local_phone(self) -> str:
+        return "0" + self.phone[3:] if self.phone.startswith("964") else self.phone
+
+
+class Payment(Base):
+    """طلب اشتراك أرسله المحل بعد التحويل، ينتظر تأكيد الإدارة."""
+
+    __tablename__ = "payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    shop_id: Mapped[int] = mapped_column(Integer, index=True)
+    plan: Mapped[str] = mapped_column(String(10))
+    amount: Mapped[int] = mapped_column(Integer)
+    txn_ref: Mapped[str] = mapped_column(String(60), default="")
+    proof_path: Mapped[str] = mapped_column(String(120), default="")
+    status: Mapped[str] = mapped_column(String(10), default="pending", index=True)  # pending/approved/rejected
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 Base.metadata.create_all(engine)
 
 
@@ -259,7 +336,7 @@ def ensure_columns() -> None:
     """ترقية بسيطة لقواعد البيانات القديمة: يضيف الأعمدة الجديدة إن لم تكن موجودة."""
     wanted = {
         "deals": {"paid_until": "DATE", "ends_on": "DATE", "trial_until": "DATE",
-                  "tg_posted": "BOOLEAN DEFAULT FALSE"},
+                  "tg_posted": "BOOLEAN DEFAULT FALSE", "shop_id": "INTEGER"},
         "click_events": {"source": "VARCHAR(20) DEFAULT 'direct'"},
     }
     insp = inspect(engine)
@@ -414,7 +491,7 @@ def normalize_link(raw: str) -> str:
     return raw
 
 
-def save_image(upload: UploadFile) -> str:
+def save_image(upload: UploadFile, folder: Optional[Path] = None) -> str:
     """يتحقق من الصورة، يصغّرها ويحوّلها إلى WebP خفيف، ويعيد اسم الملف."""
     data = upload.file.read(MAX_IMAGE_BYTES + 1)
     if len(data) > MAX_IMAGE_BYTES:
@@ -433,13 +510,14 @@ def save_image(upload: UploadFile) -> str:
     except Exception:
         raise invalid
     name = f"{uuid.uuid4().hex}.webp"
-    img.save(UPLOAD_DIR / name, "WEBP", quality=80)
+    img.save((folder or UPLOAD_DIR) / name, "WEBP", quality=80)
     return name
 
 
 def delete_image(name: str) -> None:
     if name:
-        (UPLOAD_DIR / Path(name).name).unlink(missing_ok=True)
+        for folder in (UPLOAD_DIR, PROOF_DIR):
+            (folder / Path(name).name).unlink(missing_ok=True)
 
 
 def clean_source(raw: str) -> str:
@@ -555,6 +633,118 @@ def site_base(request: Request) -> str:
     return str(request.base_url).rstrip("/")
 
 
+def tg_send(chat_id: str, text: str, **extra) -> bool:
+    """رسالة نصية لمحادثة تيليغرام (صاحب محل أو المدير)."""
+    return bool(chat_id) and telegram_call("sendMessage", {"chat_id": chat_id, "text": text, **extra})
+
+
+def tg_admin(text: str) -> None:
+    tg_send(TELEGRAM_ADMIN_CHAT, text)
+
+
+# ─────────────────────────── بوابة المحلات: أدوات ───────────────────────────
+
+def hash_password(password: str) -> str:
+    """scrypt بملح عشوائي: لا يمكن استرجاع كلمة المرور من المخزَّن."""
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
+    return f"scrypt${salt.hex()}${digest.hex()}"
+
+
+def check_password(password: str, stored: str) -> bool:
+    try:
+        _, salt, digest = stored.split("$")
+        got = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), n=2 ** 14, r=8, p=1, dklen=32)
+        return hmac.compare_digest(got.hex(), digest)
+    except Exception:
+        return False
+
+
+def _shop_sig(shop: "Shop", exp: str) -> str:
+    # كلمة المرور داخل التوقيع: تغييرها يُخرج كل الأجهزة الأخرى
+    return hmac.new(SECRET_KEY, f"shop:{shop.id}:{exp}:{shop.password_hash}".encode(), hashlib.sha256).hexdigest()
+
+
+def set_shop_cookie(response, shop: "Shop", request: Request) -> None:
+    exp = str(int(time.time()) + SHOP_SESSION_DAYS * 86400)
+    # lax وليس strict: حتى يبقى المحل داخلاً حين يفتح الرابط القادم من تيليغرام
+    response.set_cookie(SHOP_COOKIE, f"{shop.id}.{exp}.{_shop_sig(shop, exp)}", max_age=SHOP_SESSION_DAYS * 86400,
+                        httponly=True, samesite="lax", secure=request.url.scheme == "https")
+
+
+def current_shop(request: Request, db: Session) -> Optional["Shop"]:
+    parts = request.cookies.get(SHOP_COOKIE, "").split(".")
+    if len(parts) != 3 or not all(p.isascii() for p in parts) or not (parts[0].isdigit() and parts[1].isdigit()):
+        return None
+    if len(parts[0]) > 10 or len(parts[1]) > 12 or int(parts[1]) < time.time():
+        return None
+    shop = db.get(Shop, int(parts[0]))
+    if not shop or not hmac.compare_digest(parts[2].encode(), _shop_sig(shop, parts[1]).encode()):
+        return None
+    return shop
+
+
+class ShopLoginRequired(Exception):
+    pass
+
+
+def require_shop(request: Request, db: Session = Depends(get_db)) -> "Shop":
+    shop = current_shop(request, db)
+    if not shop:
+        raise ShopLoginRequired()
+    return shop
+
+
+def sync_shop_deals(db: Session, shop: "Shop") -> None:
+    """ينسخ اشتراك المحل وباقته واسمه إلى كل عروضه، فيبقى منطق الظهور والإخفاء واحداً."""
+    db.execute(update(Deal).where(Deal.shop_id == shop.id).values(
+        trial_until=shop.trial_until, paid_until=shop.paid_until, is_vip=shop.is_vip, shop_name=shop.name))
+
+
+def shop_start_trial(shop: "Shop") -> None:
+    if shop.paid_until is None and shop.trial_until is None:
+        shop.trial_until = today() + timedelta(days=TRIAL_DAYS)
+
+
+def renew_shop(db: Session, shop: "Shop", vip: bool) -> None:
+    """يمدّد اشتراك المحل 30 يوماً من نهاية مدته الحالية (أو من اليوم إن انتهت) ويضبط باقته."""
+    start = max(shop.active_until or today(), today())
+    shop.paid_until = start + timedelta(days=SUBSCRIPTION_DAYS)
+    shop.is_vip = vip
+    shop.reminded_on = None
+    sync_shop_deals(db, shop)
+
+
+def make_reset_link(db: Session, shop: "Shop", base: str) -> str:
+    """رابط استرجاع كلمة المرور: يُستعمل مرة واحدة وينتهي بعد RESET_MINUTES. نخزّن بصمته فقط."""
+    token = secrets.token_urlsafe(24)
+    shop.reset_hash = hashlib.sha256(token.encode()).hexdigest()
+    shop.reset_expires = utcnow() + timedelta(minutes=RESET_MINUTES)
+    db.commit()
+    return f"{base}/shop/reset/{token}"
+
+
+def run_reminders() -> int:
+    """يذكّر المحلات على تيليغرام قبل انتهاء المدة بـ 3 أيام وفي يومها. يعيد عدد الرسائل المرسلة."""
+    base = PUBLIC_URL
+    sent = 0
+    with SessionLocal() as db:
+        shops = db.scalars(select(Shop).where(Shop.verified.is_(True), Shop.tg_chat_id != "")).all()
+        for shop in shops:
+            left = shop.days_left
+            if left not in (3, 0) or shop.reminded_on == today():
+                continue
+            kind = "اشتراكك" if shop.paid_until else "شهرك المجاني"
+            when = "ينتهي اليوم" if left == 0 else "ينتهي بعد 3 أيام"
+            text = (f"⏳ {shop.name}: {kind} في {SITE_NAME} {when}.\n"
+                    f"جدّد من بوابتك حتى تبقى عروضك ظاهرة:\n{base}/shop/pay")
+            if tg_send(shop.tg_chat_id, text):
+                shop.reminded_on = today()
+                sent += 1
+        db.commit()
+    return sent
+
+
 def validate_deal(shop_name, title, category, area, old_price, new_price, link, contact_phone):
     """يعيد (البيانات النظيفة، قائمة الأخطاء)."""
     errors: list[str] = []
@@ -639,7 +829,7 @@ select option{background:#15151c;color:#f1f5f9}
 <header class="sticky top-0 z-30 bg-[#0a0a0f]/85 backdrop-blur-md border-b border-white/10">
   <div class="max-w-5xl mx-auto px-4 h-14 flex items-center justify-between">
     <a href="/" class="text-2xl font-extrabold text-white">🔥 <span class="glow-text">{{ site_name }}</span></a>
-    <a href="/submit" class="text-sm font-bold bg-white text-slate-900 rounded-full px-4 py-2 active:scale-95 transition">+ أضف عرض محلك</a>
+    <a href="/shop" class="text-sm font-bold bg-white text-slate-900 rounded-full px-4 py-2 active:scale-95 transition">+ أضف عرض محلك</a>
   </div>
 </header>
 <main id="main" class="max-w-5xl mx-auto px-4 pb-16" tabindex="-1">{% block content %}{% endblock %}</main>
@@ -784,7 +974,7 @@ document.addEventListener('click',function(e){
 <section class="mt-10 rounded-3xl glass p-6 text-center">
   <p class="text-xl font-extrabold">عندك محل أو بيج <span class="glow-text">بالموصل</span>؟</p>
   <p class="text-sm text-slate-400 mt-1">انشر عرضك هنا ووصّله لزبائن جدد كل يوم.</p>
-  <a href="/submit" class="mt-3 inline-block bg-amber-400 text-amber-950 font-extrabold rounded-xl px-6 py-2.5 active:scale-95 transition">أضف عرضك مجاناً</a>
+  <a href="/join" class="mt-3 inline-block bg-amber-400 text-amber-950 font-extrabold rounded-xl px-6 py-2.5 active:scale-95 transition">أضف عرضك مجاناً</a>
 </section>
 
 <script>
@@ -814,8 +1004,10 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   {% endif %}
 
   <form method="post" action="{{ action }}" enctype="multipart/form-data" class="mt-5 space-y-4">
+    {% if not shop_mode %}
     <label class="block"><span class="text-sm font-bold">اسم المحل / البيج</span>
       <input name="shop_name" value="{{ form.shop_name }}" required maxlength="80" class="{{ inp }} mt-1"></label>
+    {% endif %}
     <label class="block"><span class="text-sm font-bold">وصف العرض</span>
       <input name="title" value="{{ form.title }}" required maxlength="140" placeholder="مثال: وجبة برغر دبل + بطاطا + مشروب" class="{{ inp }} mt-1"></label>
     <div class="grid grid-cols-2 gap-3">
@@ -842,14 +1034,17 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
     <label class="block"><span class="text-sm font-bold">رابط الطلب (إنستغرام أو رقم واتساب)</span>
       <input name="link" value="{{ form.link }}" required dir="ltr" placeholder="07701234567" class="{{ inp }} mt-1 text-left">
       <span class="block text-xs text-slate-400 mt-1">اكتب رقم الواتساب، أو اسم حساب الإنستغرام، أو الرابط كاملاً.</span></label>
+    {% if not shop_mode %}
     <label class="block"><span class="text-sm font-bold">رقم للتواصل معك <span class="font-normal text-slate-400">(لا يظهر للزوار)</span></span>
       <input name="contact_phone" value="{{ form.contact_phone }}" inputmode="tel" dir="ltr" placeholder="07701234567" class="{{ inp }} mt-1 text-left"></label>
+    {% endif %}
     <label class="block"><span class="text-sm font-bold">صورة العرض {% if deal %}<span class="font-normal text-slate-400">(اتركها فارغة للإبقاء على الصورة الحالية)</span>{% endif %}</span>
       <img id="image_preview" {% if deal %}src="{{ deal.image_url }}"{% endif %} alt="" class="{{ '' if deal else 'hidden' }} mt-2 w-28 h-28 object-cover rounded-xl ring-1 ring-slate-200">
       <input id="image_input" type="file" name="image" accept="image/jpeg,image/png,image/webp" {{ '' if deal else 'required' }}
              class="mt-2 block w-full text-sm file:ml-3 file:rounded-full file:border-0 file:bg-rose-50 file:text-rose-700 file:font-bold file:px-4 file:py-2"></label>
 
-    {% if deal %}
+    {% if shop_mode %}
+    {% elif deal %}
     <div class="grid grid-cols-2 gap-3">
       <label class="block"><span class="text-sm font-bold">التجربة المجانية حتى</span>
         <input type="date" name="trial_until" value="{{ form.trial_until }}" class="{{ inp }} mt-1"></label>
@@ -866,7 +1061,8 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
     {% endif %}
 
     <button id="submit_btn" class="w-full bg-rose-600 text-white font-extrabold rounded-xl py-3 text-base active:scale-95 transition disabled:opacity-60">{{ submit_label }}</button>
-    {% if deal %}<a href="/admin" class="block text-center text-sm text-slate-500">إلغاء والعودة للوحة التحكم</a>{% endif %}
+    {% if shop_mode %}<a href="/shop" class="block text-center text-sm text-slate-500">إلغاء والعودة لبوابتي</a>
+    {% elif deal %}<a href="/admin" class="block text-center text-sm text-slate-500">إلغاء والعودة للوحة التحكم</a>{% endif %}
   </form>
 </div>
 <script>
@@ -967,7 +1163,8 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   <p class="inline-flex items-center gap-2 text-[11px] font-bold tracking-wide text-amber-300 border border-amber-400/40 bg-amber-400/10 rounded-full px-3 py-1">لأصحاب المحلات والبيجات</p>
   <h1 class="mt-3 text-4xl md:text-6xl font-extrabold leading-[1.2] tracking-tight">وصّل عرضك <span class="glow-text">لزبائن الموصل</span></h1>
   <p class="mt-3 text-sm md:text-base text-slate-400 max-w-md mx-auto">{{ site_name }} يجمع عروض المدينة بمكان واحد. انشر عرضك، والزبون يضغط ويوصل مباشرة لواتسابك أو صفحتك.</p>
-  <a href="/submit" class="mt-5 inline-block bg-gradient-to-l from-rose-600 to-orange-500 text-white font-extrabold rounded-full px-8 py-3.5 active:scale-95 transition">جرّب شهراً مجاناً</a>
+  <a href="/shop/register" class="mt-5 inline-block bg-gradient-to-l from-rose-600 to-orange-500 text-white font-extrabold rounded-full px-8 py-3.5 active:scale-95 transition">سجّل محلك — شهر مجاناً</a>
+  <p class="mt-3 text-xs text-slate-500">عندك حساب؟ <a href="/shop/login" class="underline font-bold text-slate-300">ادخل لبوابتك</a></p>
 </section>
 
 <h2 class="mt-10 mb-3 text-lg font-extrabold">شلون يشتغل؟</h2>
@@ -1027,7 +1224,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
 <section class="mt-10 rounded-3xl glass p-6 text-center">
   <p class="text-xl font-extrabold">جاهز تنشر أول عرض؟</p>
   <div class="mt-4 flex flex-wrap justify-center gap-3">
-    <a href="/submit" class="bg-amber-400 text-amber-950 font-extrabold rounded-full px-6 py-3 active:scale-95 transition">أضف عرضك الآن</a>
+    <a href="/shop/register" class="bg-amber-400 text-amber-950 font-extrabold rounded-full px-6 py-3 active:scale-95 transition">سجّل محلك الآن</a>
     {% if contact_wa %}<a href="https://wa.me/{{ contact_wa }}" target="_blank" rel="noopener" class="border border-white/20 text-slate-200 font-bold rounded-full px-6 py-3 active:scale-95 transition">راسلنا واتساب</a>{% endif %}
   </div>
 </section>
@@ -1081,6 +1278,229 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
     <li>لا نبيع أي بيانات ولا نشاركها مع أي طرف.</li>
   </ul>
 </article>
+{% endblock %}""",
+    "shop_auth.html": """{% extends "base.html" %}
+{% block title %}{{ heading }} — {{ site_name }}{% endblock %}
+{% set inp = "w-full rounded-xl border border-white/15 bg-white/5 text-white placeholder-slate-500 px-3 py-2.5 text-base focus:outline-none focus:ring-2 focus:ring-rose-500" %}
+{% block content %}
+<div class="max-w-sm mx-auto pt-10">
+  <h1 class="text-2xl font-extrabold text-center">{{ heading }}</h1>
+  {% if intro %}<p class="mt-2 text-sm text-slate-400 text-center">{{ intro }}</p>{% endif %}
+  {% if error %}<p class="mt-4 bg-rose-50 border border-rose-200 text-rose-700 text-sm rounded-xl p-3">{{ error }}</p>{% endif %}
+  {% if notice %}<p class="mt-4 bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm rounded-xl p-3">{{ notice }}</p>{% endif %}
+
+  {% if mode != 'done' %}
+  <form method="post" action="{{ action }}" class="mt-5 space-y-4">
+    {% if mode == 'register' %}
+    <label class="block"><span class="text-sm font-bold">اسم المحل / البيج</span>
+      <input name="name" value="{{ form.name }}" required maxlength="80" class="{{ inp }} mt-1"></label>
+    {% endif %}
+    {% if mode in ('register', 'login', 'forgot') %}
+    <label class="block"><span class="text-sm font-bold">رقم الهاتف</span>
+      <input name="phone" value="{{ form.phone }}" required inputmode="tel" dir="ltr" placeholder="07701234567" autocomplete="tel" class="{{ inp }} mt-1 text-left"></label>
+    {% endif %}
+    {% if mode in ('register', 'login', 'reset') %}
+    <label class="block"><span class="text-sm font-bold">{{ 'كلمة مرور جديدة' if mode == 'reset' else 'كلمة المرور' }}</span>
+      <input type="password" name="password" required minlength="8" maxlength="100"
+             autocomplete="{{ 'current-password' if mode == 'login' else 'new-password' }}" class="{{ inp }} mt-1">
+      {% if mode != 'login' %}<span class="block text-xs text-slate-400 mt-1">8 أحرف على الأقل.</span>{% endif %}</label>
+    {% endif %}
+    {% if mode == 'register' %}<div class="hidden" aria-hidden="true"><input name="website" tabindex="-1" autocomplete="off"></div>{% endif %}
+    <button class="w-full bg-gradient-to-l from-rose-600 to-orange-500 text-white font-extrabold rounded-full py-3 active:scale-95 transition">{{ submit_label }}</button>
+  </form>
+  {% endif %}
+
+  <p class="mt-5 text-sm text-slate-400 text-center space-x-3 space-x-reverse">
+    {% if mode == 'login' %}
+      <a href="/shop/register" class="underline font-bold text-slate-200">سجّل محلاً جديداً</a>
+      <a href="/shop/forgot" class="underline">نسيت كلمة المرور</a>
+    {% else %}
+      <a href="/shop/login" class="underline font-bold text-slate-200">عندي حساب — دخول</a>
+    {% endif %}
+  </p>
+</div>
+{% endblock %}""",
+    "shop_home.html": """{% extends "base.html" %}
+{% from "macros.html" import card %}
+{% block title %}بوابة {{ shop.name }} — {{ site_name }}{% endblock %}
+{% block content %}
+<div class="pt-6 flex items-center justify-between gap-3">
+  <div class="min-w-0">
+    <p class="text-xs text-slate-400">بوابة المحل</p>
+    <h1 class="text-2xl font-extrabold truncate">{{ shop.name }}</h1>
+  </div>
+  <form method="post" action="/shop/logout"><button class="text-sm text-slate-400 underline shrink-0">خروج</button></form>
+</div>
+
+{% if notice %}<p class="mt-4 bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm font-bold rounded-xl p-3">{{ notice }}</p>{% endif %}
+
+{% if not shop.verified %}
+<section class="mt-4 rounded-3xl glass p-5 text-center">
+  <p class="text-4xl">📱</p>
+  <h2 class="mt-2 text-xl font-extrabold">أكّد رقم هاتفك</h2>
+  <p class="mt-1 text-sm text-slate-400">خطوة واحدة قبل نشر أول عرض: نتأكد أن الرقم <b dir="ltr" class="text-white">{{ shop.local_phone }}</b> لك.</p>
+  {% if verify_url %}
+  <a href="{{ verify_url }}" target="_blank" rel="noopener" class="mt-4 inline-block bg-sky-500 text-white font-extrabold rounded-full px-7 py-3 active:scale-95 transition">أكّد عبر تيليغرام</a>
+  <ol class="mt-4 text-xs text-slate-400 space-y-1 text-right max-w-xs mx-auto list-decimal pr-5">
+    <li>اضغط الزر فينفتح بوت {{ site_name }} في تيليغرام.</li>
+    <li>اضغط «ابدأ» ثم «مشاركة رقمي».</li>
+    <li>ارجع لهذه الصفحة وحدّثها.</li>
+  </ol>
+  {% else %}
+  <p class="mt-4 text-sm text-amber-300 font-bold">التأكيد الآلي غير متاح حالياً. {% if contact_wa %}راسلنا على واتساب ونؤكد حسابك.{% else %}سنؤكد حسابك خلال وقت قصير.{% endif %}</p>
+  {% if contact_wa %}<a href="https://wa.me/{{ contact_wa }}?text={{ ('أريد تأكيد حساب محلي في ' ~ site_name ~ ': ' ~ shop.name) | urlencode }}" target="_blank" rel="noopener" class="mt-3 inline-block bg-white text-slate-900 font-bold rounded-full px-6 py-2.5">راسلنا واتساب</a>{% endif %}
+  {% endif %}
+</section>
+{% else %}
+
+<section class="mt-4 rounded-3xl p-5 {{ 'bg-[#15151c] ring-1 ring-amber-400/80' if shop.is_vip and shop.is_paid else 'glass' }}">
+  <div class="flex items-start justify-between gap-3">
+    <div>
+      <p class="text-xs text-slate-400">الاشتراك</p>
+      {% if shop.active_until is none %}
+        <p class="mt-1 font-extrabold">لم يبدأ بعد</p>
+        <p class="text-xs text-slate-400 mt-1">شهرك المجاني يبدأ عند نشر أول عرض.</p>
+      {% elif shop.days_left < 0 %}
+        <p class="mt-1 font-extrabold text-rose-400">⛔ {{ 'انتهى الاشتراك' if shop.paid_until else 'انتهى الشهر المجاني' }}</p>
+        <p class="text-xs text-slate-400 mt-1">عروضك مخفية أو ستُخفى قريباً. جدّد لتعود فوراً.</p>
+      {% else %}
+        <p class="mt-1 font-extrabold">{{ ('باقة ' ~ ('VIP 🔥' if shop.is_vip else 'الأساسية')) if shop.paid_until else '🎁 الشهر المجاني' }}</p>
+        <p class="text-xs mt-1 {{ 'text-amber-300 font-bold' if shop.days_left <= 5 else 'text-slate-400' }}">باقي {{ shop.days_left }} يوم — حتى {{ shop.active_until }}</p>
+      {% endif %}
+    </div>
+    {% if pending_payment %}
+    <span class="shrink-0 text-xs font-bold text-amber-300 border border-amber-400/40 bg-amber-400/10 rounded-full px-3 py-1.5">⏳ دفعتك قيد المراجعة</span>
+    {% else %}
+    <a href="/shop/pay" class="shrink-0 bg-amber-400 text-amber-950 text-sm font-extrabold rounded-full px-4 py-2 active:scale-95 transition">{{ 'جدّد / رقِّ' if shop.active_until else 'الباقات' }}</a>
+    {% endif %}
+  </div>
+</section>
+
+<section class="mt-3 grid grid-cols-3 gap-2 text-center">
+  {% for value, label in [(stats.d7, 'نقرة آخر 7 أيام'), (stats.d30, 'نقرة آخر 30 يوم'), (stats.total, 'كل النقرات')] %}
+  <div class="glass rounded-2xl py-3">
+    <p class="text-2xl font-extrabold text-emerald-300">{{ value | price }}</p>
+    <p class="text-[11px] text-slate-400 mt-0.5">{{ label }}</p>
+  </div>
+  {% endfor %}
+</section>
+<p class="mt-2 text-xs text-slate-500">النقرة = شخص ضغط «اطلب العرض» وتحوّل لصفحتك. كل شخص يُحسب مرة واحدة.</p>
+
+<div class="mt-6 flex items-center justify-between">
+  <h2 class="text-lg font-extrabold">عروضي <span class="text-sm font-medium text-slate-400">({{ deals | length }} من {{ shop.deal_limit }})</span></h2>
+  {% if deals | length < shop.deal_limit %}
+  <a href="/shop/deals/new" class="bg-white text-slate-900 text-sm font-extrabold rounded-full px-4 py-2 active:scale-95 transition">+ عرض جديد</a>
+  {% endif %}
+</div>
+{% if deals | length >= shop.deal_limit %}
+<p class="mt-1 text-xs text-slate-500">وصلت حد باقتك. {% if not (shop.is_vip and shop.is_paid) %}باقة VIP تسمح بـ {{ vip_limit }} عروض مع التثبيت بأعلى الموقع.{% endif %}</p>
+{% endif %}
+
+<section class="mt-3 space-y-3">
+  {% for d in deals %}
+  <div class="rounded-2xl bg-[#15151c] ring-1 ring-white/10 p-3">
+    <div class="flex gap-3">
+      <img src="{{ d.image_url }}" alt="" loading="lazy" class="w-20 h-20 rounded-xl object-cover shrink-0">
+      <div class="min-w-0 flex-1">
+        <p class="font-bold text-sm leading-snug line-clamp-2">{{ d.title }}</p>
+        <p class="text-xs text-slate-400 mt-1">{{ d.new_price | price }} د.ع <span class="line-through text-slate-500">{{ d.old_price | price }}</span> <span dir="ltr">(-{{ d.discount_percent }}%)</span></p>
+        <p class="text-xs font-bold mt-1">
+          {% if not d.is_approved %}<span class="text-amber-300">⏳ بانتظار المراجعة</span>
+          {% elif not d.is_live %}<span class="text-rose-400">⛔ مخفي — {{ 'انتهى تاريخ العرض' if d.ends_on and d.ends_on < today else 'انتهت المدة، جدّد ليظهر' }}</span>
+          {% else %}<span class="text-emerald-300">● منشور</span>{% endif %}
+        </p>
+      </div>
+      <div class="text-center shrink-0">
+        <p class="text-xl font-extrabold text-emerald-300">{{ clicks_30d.get(d.id, 0) }}</p>
+        <p class="text-[10px] text-slate-400">نقرة / 30 يوم</p>
+      </div>
+    </div>
+    <div class="mt-2 flex flex-wrap gap-2">
+      <a href="/shop/deals/{{ d.id }}/edit" class="text-xs font-bold rounded-lg px-3 py-2 border border-white/15 text-slate-200">تعديل</a>
+      {% if d.is_approved and d.is_live %}<a href="/deal/{{ d.id }}" target="_blank" class="text-xs font-bold rounded-lg px-3 py-2 border border-white/15 text-slate-200">عرض في الموقع</a>{% endif %}
+      <form method="post" action="/shop/deals/{{ d.id }}/delete" onsubmit="return confirm('حذف هذا العرض نهائياً؟')">
+        <button class="text-xs font-bold rounded-lg px-3 py-2 border border-rose-400/40 text-rose-300">حذف</button></form>
+    </div>
+  </div>
+  {% else %}
+  <div class="rounded-3xl glass p-6 text-center">
+    <p class="text-4xl">🛍️</p>
+    <p class="mt-2 font-bold">ما عندك عروض بعد</p>
+    <p class="text-sm text-slate-400 mt-1">أضف أول عرض وشهرك المجاني يبدأ عند نشره.</p>
+    <a href="/shop/deals/new" class="mt-4 inline-block bg-gradient-to-l from-rose-600 to-orange-500 text-white font-extrabold rounded-full px-7 py-3">أضف أول عرض</a>
+  </div>
+  {% endfor %}
+</section>
+
+{% if not shop.tg_chat_id and verify_url %}
+<p class="mt-6 text-xs text-slate-500">💡 <a href="{{ verify_url }}" target="_blank" rel="noopener" class="underline">اربط حسابك ببوت {{ site_name }} في تيليغرام</a> لتصلك إشعارات قبول العروض وتذكير التجديد.</p>
+{% endif %}
+{% endif %}
+{% endblock %}""",
+    "shop_pay.html": """{% extends "base.html" %}
+{% block title %}الاشتراك — {{ site_name }}{% endblock %}
+{% set inp = "w-full rounded-xl border border-white/15 bg-white/5 text-white placeholder-slate-500 px-3 py-2.5 text-base focus:outline-none focus:ring-2 focus:ring-rose-500" %}
+{% block content %}
+<div class="max-w-lg mx-auto pt-6">
+  <a href="/shop" class="text-sm font-bold text-slate-500">→ بوابتي</a>
+  <h1 class="mt-2 text-2xl font-extrabold">الاشتراك</h1>
+
+  {% if pending %}
+  <section class="mt-4 rounded-3xl glass p-6 text-center">
+    <p class="text-4xl">⏳</p>
+    <p class="mt-2 font-extrabold">دفعتك قيد المراجعة</p>
+    <p class="mt-1 text-sm text-slate-400">باقة {{ plan_names[pending.plan] }} — {{ pending.amount | price }} د.ع. يتفعّل اشتراكك فور تأكيد استلام المبلغ{{ '، ويصلك إشعار على تيليغرام' if shop.tg_chat_id else '' }}.</p>
+  </section>
+  {% else %}
+  {% if errors %}<ul class="mt-4 bg-rose-50 border border-rose-200 text-rose-700 text-sm rounded-xl p-3 space-y-1">{% for e in errors %}<li>• {{ e }}</li>{% endfor %}</ul>{% endif %}
+
+  <form method="post" action="/shop/pay" enctype="multipart/form-data" class="mt-4 space-y-4">
+    <fieldset class="grid grid-cols-2 gap-3">
+      <legend class="sr-only">اختر الباقة</legend>
+      {% for key, price_, lines in [('basic', basic_price, ['عرض واحد منشور', 'إحصائيات حيّة']), ('vip', vip_price, [vip_limit ~ ' عروض', 'تثبيت بأعلى الموقع', 'إطار ذهبي'])] %}
+      <label class="block cursor-pointer">
+        <input type="radio" name="plan" value="{{ key }}" class="peer sr-only" {{ 'checked' if (form.plan or ('vip' if shop.is_vip else 'basic')) == key }} required>
+        <div class="h-full rounded-2xl bg-[#15151c] ring-1 ring-white/10 p-4 peer-checked:ring-2 {{ 'peer-checked:ring-amber-400' if key == 'vip' else 'peer-checked:ring-rose-500' }}">
+          <p class="font-extrabold">{{ '🔥 VIP' if key == 'vip' else 'الأساسية' }}</p>
+          <p class="mt-1 text-2xl font-extrabold">{{ price_ | price }} <span class="text-xs font-bold text-slate-400">د.ع / شهر</span></p>
+          <ul class="mt-2 text-xs text-slate-400 space-y-1">{% for l in lines %}<li>✓ {{ l }}</li>{% endfor %}</ul>
+        </div>
+      </label>
+      {% endfor %}
+    </fieldset>
+
+    <section class="rounded-2xl glass p-4 text-sm">
+      <p class="font-extrabold">طريقة الدفع</p>
+      <ol class="mt-2 space-y-1 text-slate-300 list-decimal pr-5">
+        <li>حوّل قيمة الباقة عبر زين كاش{% if zaincash %} إلى الرقم <b dir="ltr" class="text-white select-all">{{ zaincash }}</b>{% endif %}.</li>
+        <li>اكتب رقم العملية أو ارفع صورة الإيصال هنا.</li>
+        <li>نؤكد الاستلام فيتفعّل اشتراكك 30 يوماً تُضاف على أيامك الباقية.</li>
+      </ol>
+    </section>
+
+    <label class="block"><span class="text-sm font-bold">رقم العملية</span>
+      <input name="txn_ref" value="{{ form.txn_ref }}" maxlength="60" dir="ltr" class="{{ inp }} mt-1 text-left"></label>
+    <label class="block"><span class="text-sm font-bold">صورة الإيصال</span>
+      <input type="file" name="proof" accept="image/jpeg,image/png,image/webp"
+             class="mt-2 block w-full text-sm file:ml-3 file:rounded-full file:border-0 file:bg-rose-50 file:text-rose-700 file:font-bold file:px-4 file:py-2"></label>
+    <button class="w-full bg-amber-400 text-amber-950 font-extrabold rounded-full py-3 active:scale-95 transition">أرسل للتأكيد</button>
+  </form>
+  {% endif %}
+</div>
+{% endblock %}""",
+    "admin_link.html": """{% extends "base.html" %}
+{% block body %}bg-slate-50 text-slate-800{% endblock %}
+{% block ambient %}{% endblock %}
+{% block content %}
+<div class="max-w-lg mx-auto pt-10 text-center">
+  <h1 class="text-xl font-extrabold">رابط استرجاع كلمة المرور — {{ shop.name }}</h1>
+  <p class="mt-2 text-sm text-slate-500">صالح {{ minutes }} دقيقة ولمرة واحدة. أرسله لصاحب المحل فقط.</p>
+  <p class="mt-4 bg-white border border-slate-200 rounded-xl p-3 text-xs font-mono break-all select-all" dir="ltr">{{ link }}</p>
+  <div class="mt-4 flex flex-wrap justify-center gap-2">
+    <a href="https://wa.me/{{ shop.phone }}?text={{ ('رابط تعيين كلمة مرور جديدة لحسابك في ' ~ site_name ~ ':\\n' ~ link) | urlencode }}" target="_blank" rel="noopener" class="bg-emerald-600 text-white font-bold rounded-full px-5 py-2.5">أرسله بالواتساب</a>
+    <a href="/admin" class="border border-slate-300 font-bold rounded-full px-5 py-2.5">رجوع</a>
+  </div>
+</div>
 {% endblock %}""",
     "admin_login.html": """{% extends "base.html" %}
 {% block title %}دخول الإدارة — {{ site_name }}{% endblock %}
@@ -1144,6 +1564,65 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   <p dir="ltr" class="text-xs text-slate-500 font-mono text-left mt-1 leading-relaxed">/?src=instagram<br>/?src=tiktok<br>/?src=telegram</p>
 </section>
 
+{% if payments %}
+<section class="mt-3 bg-amber-50 rounded-2xl border border-amber-300 p-4">
+  <h2 class="font-extrabold">💰 دفعات تنتظر تأكيدك <span class="text-xs font-medium text-slate-500">({{ payments | length }})</span></h2>
+  <p class="text-xs text-slate-500 mt-1">تأكد من وصول المبلغ إلى محفظتك أولاً. التأكيد يفعّل الاشتراك 30 يوماً ويُشعر المحل.</p>
+  {% for p, s in payments %}
+  <div class="mt-3 bg-white rounded-xl border border-amber-200 p-3 text-sm">
+    <p class="font-extrabold">{{ s.name }} <span class="font-normal text-slate-500" dir="ltr">{{ s.local_phone }}</span></p>
+    <p class="mt-1">باقة {{ plan_names[p.plan] }} — <b>{{ p.amount | price }} د.ع</b>
+      {% if p.txn_ref %} · رقم العملية: <b dir="ltr" class="select-all">{{ p.txn_ref }}</b>{% endif %}
+      {% if p.proof_path %} · <a href="/admin/proofs/{{ p.proof_path }}" target="_blank" class="underline font-bold">صورة الإيصال</a>{% endif %}</p>
+    <p class="text-xs text-slate-400 mt-1">{{ p.created_at.strftime('%Y-%m-%d %H:%M') }} UTC</p>
+    <div class="mt-2 flex gap-2">
+      <form method="post" action="/admin/payments/{{ p.id }}/approve" onsubmit="return confirm('هل وصل المبلغ فعلاً؟ سيتفعّل الاشتراك.')">
+        <button class="{{ btn }} bg-emerald-600 border-emerald-600 text-white">✓ وصل المبلغ — فعّل</button></form>
+      <form method="post" action="/admin/payments/{{ p.id }}/reject" onsubmit="return confirm('رفض هذه الدفعة؟')">
+        <button class="{{ btn }} border-rose-300 text-rose-600">رفض</button></form>
+    </div>
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
+<details class="mt-3 bg-white rounded-2xl border border-slate-100 p-4" {{ 'open' if shops | rejectattr('verified') | list }}>
+  <summary class="font-extrabold cursor-pointer">🏪 المحلات المسجّلة <span class="text-xs font-medium text-slate-400">({{ shops | length }})</span></summary>
+  {% if not bot_ready %}<p class="mt-2 text-xs text-amber-700 bg-amber-50 rounded-lg p-2">بوت تيليغرام غير مفعّل، فالتأكيد الآلي للأرقام متوقف. أكّد المحلات الجديدة يدوياً من الزر أدناه بعد أن يراسلك صاحبها.</p>{% endif %}
+  {% for s in shops %}
+  <div class="mt-3 border-t border-slate-100 pt-3 text-sm">
+    <div class="flex flex-wrap items-center gap-1.5">
+      <span class="font-extrabold">{{ s.name }}</span>
+      <span class="text-slate-500" dir="ltr">{{ s.local_phone }}</span>
+      {% if not s.verified %}<span class="text-[10px] font-extrabold bg-rose-600 text-white rounded-full px-2 py-0.5">رقم غير مؤكد</span>{% endif %}
+      {% if s.trusted %}<span class="text-[10px] font-extrabold bg-emerald-100 text-emerald-800 rounded-full px-2 py-0.5">موثوق — ينشر مباشرة</span>{% endif %}
+      {% if s.is_vip %}<span class="text-[10px] font-extrabold bg-amber-300 text-amber-950 rounded-full px-2 py-0.5">VIP</span>{% endif %}
+      {% if s.tg_chat_id %}<span class="text-[10px] text-sky-700">✈ تيليغرام</span>{% endif %}
+    </div>
+    <p class="text-xs text-slate-500 mt-1">{{ deal_counts.get(s.id, 0) }} عرض ·
+      {% if s.active_until is none %}لم يبدأ اشتراكه
+      {% elif s.days_left < 0 %}<span class="text-rose-600 font-bold">انتهت مدته منذ {{ -s.days_left }} يوم</span>
+      {% else %}{{ 'مشترك' if s.paid_until else 'تجربة مجانية' }} حتى {{ s.active_until }} (باقي {{ s.days_left }} يوم){% endif %}
+      · سجّل {{ s.created_at.strftime('%Y-%m-%d') }}</p>
+    <div class="mt-2 flex flex-wrap gap-2">
+      {% if not s.verified %}
+      <form method="post" action="/admin/shops/{{ s.id }}/verify" onsubmit="return confirm('تأكدت أن الرقم لصاحب المحل؟')">
+        <button class="{{ btn }} bg-emerald-600 border-emerald-600 text-white">✓ تأكيد يدوي</button></form>
+      {% endif %}
+      <form method="post" action="/admin/shops/{{ s.id }}/trust">
+        <button class="{{ btn }} border-slate-300 text-slate-700">{{ 'سحب الثقة (مراجعة كل عرض)' if s.trusted else 'منح الثقة (نشر مباشر)' }}</button></form>
+      <form method="post" action="/admin/shops/{{ s.id }}/reset">
+        <button class="{{ btn }} border-slate-300 text-slate-700">🔑 رابط استرجاع كلمة المرور</button></form>
+      <a href="https://wa.me/{{ s.phone }}" target="_blank" rel="noopener" class="{{ btn }} border-emerald-300 text-emerald-700">واتساب</a>
+      <form method="post" action="/admin/shops/{{ s.id }}/delete" onsubmit="return confirm('حذف المحل وكل عروضه نهائياً؟')">
+        <button class="{{ btn }} border-rose-300 text-rose-600">حذف المحل</button></form>
+    </div>
+  </div>
+  {% else %}
+  <p class="mt-2 text-sm text-slate-400">لا توجد محلات مسجّلة بعد. أرسل لأصحاب المحلات رابط <span dir="ltr" class="font-mono">/join</span>.</p>
+  {% endfor %}
+</details>
+
 <div class="mt-4 flex items-center gap-2 overflow-x-auto no-scrollbar -mx-4 px-4">
   {% for key, label in [('all', 'الكل'), ('pending', 'بانتظار الموافقة'), ('live', 'منشور'), ('vip', 'VIP'), ('expiring', '⏳ اشتراك ينتهي')] %}
   <button type="button" data-tab="{{ key }}" class="shrink-0 rounded-full px-3.5 py-2 text-sm font-bold border border-slate-200 bg-white text-slate-600">{{ label }}</button>
@@ -1155,7 +1634,8 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
     <li>✓ الموافقة على عرض تبدأ شهره المجاني ({{ trial_days }} يوماً) تلقائياً.</li>
     <li>✓ بعد انتهاء المدة بـ {{ grace_days }} أيام بدون دفع يُخفى العرض وحده، ويعود فور الضغط على «دفع».</li>
     <li>✓ العرض الذي له «آخر يوم» يختفي بعده تلقائياً.</li>
-    <li>✓ العروض التي تضيفها أنت من «أضف عرض محلك» تُنشر مباشرة.</li>
+    <li>✓ المحل يسجّل ويدير عروضه من بوابته، وبعد قبول أول عرض له تُنشر عروضه مباشرة.</li>
+    <li>✓ عروضك أنت تضيفها من <a href="/submit" class="underline font-bold">الإضافة المباشرة</a> وتُنشر فوراً.</li>
     <li>✓ شارة «الأكثر طلباً» وأرقام الواجهة تُحسب من النقرات الفعلية.</li>
     <li>{{ '✓' if tg_channel else '✗' }} نشر كل عرض جديد في قناة تيليغرام{{ '' if tg_channel else ' — غير مفعّل: أضف TELEGRAM_BOT_TOKEN و TELEGRAM_CHANNEL في Render' }}.</li>
     <li>{{ '✓' if tg_admin else '✗' }} تنبيهك على تيليغرام عند وصول عرض للمراجعة{{ '' if tg_admin else ' — غير مفعّل: أضف TELEGRAM_ADMIN_CHAT في Render' }}.</li>
@@ -1298,7 +1778,7 @@ async def limits_and_headers(request: Request, call_next):
     if path.startswith("/uploads/") and response.status_code == 200:
         # أسماء الصور عشوائية ولا تتغير، فيحتفظ بها هاتف الزائر ولا يعيد تحميلها
         response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-    elif path.startswith("/admin"):
+    elif path.startswith("/admin") or path.startswith("/shop"):
         response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -1576,6 +2056,462 @@ def submit_deal(
     return render("message.html", **thanks)
 
 
+# ───────────────────────────── بوابة المحلات ─────────────────────────────
+
+@app.exception_handler(ShopLoginRequired)
+def _shop_redirect(request: Request, exc: ShopLoginRequired):
+    return RedirectResponse("/shop/login", status_code=303)
+
+
+def _auth_page(mode: str, status: int = 200, **ctx):
+    defaults = {
+        "register": dict(heading="سجّل محلك", action="/shop/register", submit_label="إنشاء الحساب",
+                         intro="حساب واحد لإدارة عروضك ومتابعة عدد من طلبوها. أول شهر مجاناً."),
+        "login": dict(heading="دخول المحلات", action="/shop/login", submit_label="دخول", intro=""),
+        "forgot": dict(heading="نسيت كلمة المرور", action="/shop/forgot", submit_label="أرسل رابط الاسترجاع",
+                       intro="اكتب رقم هاتفك المسجّل، ويصلك رابط تعيين كلمة مرور جديدة على تيليغرام."),
+        "reset": dict(heading="كلمة مرور جديدة", submit_label="حفظ", intro=""),
+        "done": dict(heading="تم", intro=""),
+    }[mode]
+    ctx = {**defaults, "form": {"name": "", "phone": ""}, "error": "", "notice": "", **ctx}
+    return render("shop_auth.html", status, mode=mode, **ctx)
+
+
+def bot_url(start: str = "") -> str:
+    if not (TELEGRAM_BOT_TOKEN and BOT_USERNAME):
+        return ""
+    return f"https://t.me/{BOT_USERNAME}" + (f"?start={start}" if start else "")
+
+
+@app.get("/shop/register", response_class=HTMLResponse)
+def shop_register_page(request: Request, db: Session = Depends(get_db)):
+    if current_shop(request, db):
+        return RedirectResponse("/shop", status_code=303)
+    return _auth_page("register")
+
+
+@app.post("/shop/register")
+def shop_register(request: Request, name: str = Form(""), phone: str = Form(""), password: str = Form(""),
+                  website: str = Form(""), db: Session = Depends(get_db)):
+    form = {"name": name, "phone": phone}
+    if website:  # حقل مخفي لا يملؤه إلا السبام
+        return RedirectResponse("/shop/login", status_code=303)
+    rate_key = f"shop-register:{client_ip(request)}"
+    if too_many(rate_key, limit=5, window=3600):
+        return _auth_page("register", 429, form=form, error="محاولات كثيرة — حاول بعد ساعة.")
+
+    name = " ".join(name.split())[:80]
+    digits = normalize_phone(phone)
+    error = ""
+    if len(name) < 2:
+        error = "اكتب اسم المحل أو البيج."
+    elif not re.fullmatch(r"9647\d{9}", digits):
+        error = "اكتب رقم هاتف عراقي صحيح، مثل 07701234567."
+    elif not (8 <= len(password) <= 100):
+        error = "كلمة المرور يجب أن تكون 8 أحرف على الأقل."
+    elif db.scalar(select(Shop.id).where(Shop.phone == digits)):
+        error = "هذا الرقم مسجّل من قبل. ادخل بحسابك، أو استعمل «نسيت كلمة المرور»."
+    if error:
+        return _auth_page("register", 400, form=form, error=error)
+
+    shop = Shop(name=name, phone=digits, password_hash=hash_password(password),
+                verify_code=secrets.token_hex(6))
+    db.add(shop)
+    db.commit()
+    record_hit(rate_key)
+    resp = RedirectResponse("/shop", status_code=303)
+    set_shop_cookie(resp, shop, request)
+    return resp
+
+
+@app.get("/shop/login", response_class=HTMLResponse)
+def shop_login_page(request: Request, db: Session = Depends(get_db)):
+    if current_shop(request, db):
+        return RedirectResponse("/shop", status_code=303)
+    return _auth_page("login")
+
+
+@app.post("/shop/login")
+def shop_login(request: Request, phone: str = Form(""), password: str = Form(""),
+               db: Session = Depends(get_db)):
+    digits = normalize_phone(phone)
+    # حدّ لكل عنوان ولكل رقم: يمنع تخمين كلمة مرور محل بعينه من عناوين كثيرة
+    keys = [f"shop-login:{client_ip(request)}", f"shop-login-phone:{digits}"]
+    if too_many(keys[0], limit=8, window=900) or too_many(keys[1], limit=8, window=900):
+        return _auth_page("login", 429, form={"phone": phone}, error="محاولات كثيرة — انتظر 15 دقيقة.")
+    shop = db.scalar(select(Shop).where(Shop.phone == digits)) if digits else None
+    # نتحقق من كلمة المرور حتى لو الرقم غير موجود، حتى لا يكشف زمن الرد أي الأرقام مسجّلة
+    valid = check_password(password, shop.password_hash if shop else hash_password("x"))
+    if not shop or not valid:
+        for key in keys:
+            record_hit(key)
+        return _auth_page("login", 401, form={"phone": phone}, error="رقم الهاتف أو كلمة المرور غير صحيحة.")
+    resp = RedirectResponse("/shop", status_code=303)
+    set_shop_cookie(resp, shop, request)
+    return resp
+
+
+@app.post("/shop/logout")
+def shop_logout():
+    resp = RedirectResponse("/", status_code=303)
+    resp.delete_cookie(SHOP_COOKIE)
+    return resp
+
+
+@app.get("/shop/forgot", response_class=HTMLResponse)
+def shop_forgot_page():
+    return _auth_page("forgot")
+
+
+@app.post("/shop/forgot")
+def shop_forgot(request: Request, phone: str = Form(""), db: Session = Depends(get_db)):
+    rate_key = f"shop-forgot:{client_ip(request)}"
+    if too_many(rate_key, limit=5, window=3600):
+        return _auth_page("forgot", 429, error="محاولات كثيرة — حاول بعد ساعة.")
+    record_hit(rate_key)
+    shop = db.scalar(select(Shop).where(Shop.phone == normalize_phone(phone)))
+    if shop and shop.tg_chat_id:
+        link = make_reset_link(db, shop, site_base(request))
+        tg_send(shop.tg_chat_id, f"🔑 رابط تعيين كلمة مرور جديدة لحسابك في {SITE_NAME} "
+                                 f"(صالح {RESET_MINUTES} دقيقة):\n{link}\n\nإن لم تطلبه أنت فتجاهل الرسالة.")
+    # الرد واحد دائماً حتى لا نكشف أي الأرقام مسجّلة
+    notice = "إن كان الرقم مسجّلاً ومربوطاً بتيليغرام فقد أرسلنا الرابط الآن."
+    if CONTACT_WHATSAPP:
+        notice += " لم تصلك رسالة؟ راسلنا على واتساب ونرسل لك الرابط."
+    return _auth_page("done", notice=notice)
+
+
+def _shop_by_reset(db: Session, token: str) -> Optional[Shop]:
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    shop = db.scalar(select(Shop).where(Shop.reset_hash == digest))
+    if not shop or not shop.reset_expires or shop.reset_expires < utcnow():
+        return None
+    return shop
+
+
+@app.get("/shop/reset/{token}", response_class=HTMLResponse)
+def shop_reset_page(token: str, db: Session = Depends(get_db)):
+    if not _shop_by_reset(db, token):
+        return _auth_page("done", 400, error="الرابط غير صالح أو انتهت صلاحيته. اطلب رابطاً جديداً.")
+    return _auth_page("reset", action=f"/shop/reset/{token}")
+
+
+@app.post("/shop/reset/{token}")
+def shop_reset(token: str, request: Request, password: str = Form(""), db: Session = Depends(get_db)):
+    shop = _shop_by_reset(db, token)
+    if not shop:
+        return _auth_page("done", 400, error="الرابط غير صالح أو انتهت صلاحيته. اطلب رابطاً جديداً.")
+    if not (8 <= len(password) <= 100):
+        return _auth_page("reset", 400, action=f"/shop/reset/{token}",
+                          error="كلمة المرور يجب أن تكون 8 أحرف على الأقل.")
+    shop.password_hash = hash_password(password)
+    shop.reset_hash, shop.reset_expires = "", None  # يُستعمل مرة واحدة
+    db.commit()
+    resp = RedirectResponse("/shop", status_code=303)
+    set_shop_cookie(resp, shop, request)
+    return resp
+
+
+def _shop_deals(db: Session, shop: Shop) -> list[Deal]:
+    return list(db.scalars(select(Deal).where(Deal.shop_id == shop.id).order_by(Deal.created_at.desc())).all())
+
+
+@app.get("/shop", response_class=HTMLResponse)
+def shop_home(request: Request, ok: str = "", shop: Shop = Depends(require_shop), db: Session = Depends(get_db)):
+    deals = _shop_deals(db, shop)
+    ids = [d.id for d in deals]
+
+    def clicks_since(days: int) -> dict:
+        if not ids:
+            return {}
+        return dict(db.execute(
+            select(ClickEvent.deal_id, func.count())
+            .where(ClickEvent.deal_id.in_(ids), ClickEvent.created_at >= utcnow() - timedelta(days=days))
+            .group_by(ClickEvent.deal_id)).all())
+
+    clicks_30d = clicks_since(30)
+    stats = dict(d7=sum(clicks_since(7).values()), d30=sum(clicks_30d.values()),
+                 total=sum(d.clicks_count for d in deals))
+    pending_payment = db.scalar(select(Payment).where(Payment.shop_id == shop.id, Payment.status == "pending"))
+    notice = {"deal": "تم حفظ العرض.", "pending": "وصلنا عرضك وسيُنشر بعد مراجعة سريعة.",
+              "deleted": "تم حذف العرض.", "paid": "وصلتنا تفاصيل دفعتك وسنؤكدها قريباً."}.get(ok, "")
+    resp = render("shop_home.html", shop=shop, deals=deals, clicks_30d=clicks_30d, stats=stats,
+                  pending_payment=pending_payment, notice=notice, today=today(),
+                  vip_limit=PLAN_LIMITS["vip"], bot_url=bot_url(),
+                  verify_url=bot_url("v" + shop.verify_code) if shop.verify_code else "")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _shop_deal_page(shop: Shop, form: dict, errors: list[str], deal: Optional[Deal], status: int = 200):
+    return render("deal_form.html", status, form=form, errors=errors, deal=deal, shop_mode=True,
+                  action=f"/shop/deals/{deal.id}/edit" if deal else "/shop/deals/new",
+                  heading="تعديل العرض" if deal else "عرض جديد",
+                  intro="" if shop.trusted else "أول عرض لك يُنشر بعد مراجعة سريعة، وبعدها تُنشر عروضك مباشرة.",
+                  submit_label="حفظ" if deal else ("نشر العرض" if shop.trusted else "إرسال للمراجعة"))
+
+
+def _owned_deal(db: Session, shop: Shop, deal_id: int) -> Deal:
+    deal = db.get(Deal, deal_id)
+    if not deal or deal.shop_id != shop.id:  # عرض محل آخر يُعامل كغير موجود
+        raise HTTPException(404)
+    return deal
+
+
+@app.get("/shop/deals/new", response_class=HTMLResponse)
+def shop_deal_new_page(shop: Shop = Depends(require_shop), db: Session = Depends(get_db)):
+    if not shop.verified or len(_shop_deals(db, shop)) >= shop.deal_limit:
+        return RedirectResponse("/shop", status_code=303)
+    return _shop_deal_page(shop, {**EMPTY_FORM, "link": shop.local_phone}, [], None)
+
+
+@app.post("/shop/deals/new")
+def shop_deal_new(
+    request: Request, background: BackgroundTasks,
+    title: str = Form(""), category: str = Form(""), area: str = Form(""),
+    old_price: str = Form(""), new_price: str = Form(""), link: str = Form(""), ends_on: str = Form(""),
+    image: Optional[UploadFile] = File(None),
+    shop: Shop = Depends(require_shop), db: Session = Depends(get_db),
+):
+    if not shop.verified or len(_shop_deals(db, shop)) >= shop.deal_limit:
+        return RedirectResponse("/shop", status_code=303)
+    form = dict(title=title, category=category, area=area, old_price=old_price, new_price=new_price,
+                link=link, ends_on=ends_on)
+    rate_key = f"shop-deal:{shop.id}"
+    if too_many(rate_key, limit=20, window=3600):
+        return _shop_deal_page(shop, form, ["محاولات كثيرة — حاول بعد ساعة."], None, 429)
+    record_hit(rate_key)
+
+    data, errors = validate_deal(shop.name, title, category, area, old_price, new_price, link, shop.local_phone)
+    ends, ends_ok = parse_optional_date(ends_on)
+    if not ends_ok or (ends and ends < today()):
+        errors.append("تاريخ انتهاء العرض غير صحيح — اختر اليوم أو تاريخاً لاحقاً")
+    data["ends_on"] = ends
+    if not image or not image.filename:
+        errors.append("أضف صورة للعرض")
+    if not errors:
+        try:
+            data["image_path"] = save_image(image)
+        except ValueError as e:
+            errors.append(str(e))
+    if errors:
+        return _shop_deal_page(shop, form, errors, None, 400)
+
+    deal = Deal(**data, shop_id=shop.id, is_approved=shop.trusted, is_vip=shop.is_vip,
+                trial_until=shop.trial_until, paid_until=shop.paid_until)
+    db.add(deal)
+    db.commit()
+    base = site_base(request)
+    if shop.trusted:  # محل موثوق: يُنشر فوراً ويُعلن عنه، ويصلك خبر فقط
+        background.add_task(announce_deal, deal.id, base)
+        background.add_task(tg_admin, f"✅ نُشر عرض جديد من محل موثوق\n{shop.name} — {deal.title}\n{base}/deal/{deal.id}")
+        return RedirectResponse("/shop?ok=deal", status_code=303)
+    background.add_task(notify_admin, deal.id, base)
+    return RedirectResponse("/shop?ok=pending", status_code=303)
+
+
+@app.get("/shop/deals/{deal_id}/edit", response_class=HTMLResponse)
+def shop_deal_edit_page(deal_id: DealId, shop: Shop = Depends(require_shop), db: Session = Depends(get_db)):
+    deal = _owned_deal(db, shop, deal_id)
+    form = dict(title=deal.title, category=deal.category, area=deal.area, old_price=deal.old_price,
+                new_price=deal.new_price, link=deal.link_url,
+                ends_on=deal.ends_on.isoformat() if deal.ends_on else "")
+    return _shop_deal_page(shop, form, [], deal)
+
+
+@app.post("/shop/deals/{deal_id}/edit")
+def shop_deal_edit(
+    deal_id: DealId, request: Request, background: BackgroundTasks,
+    title: str = Form(""), category: str = Form(""), area: str = Form(""),
+    old_price: str = Form(""), new_price: str = Form(""), link: str = Form(""), ends_on: str = Form(""),
+    image: Optional[UploadFile] = File(None),
+    shop: Shop = Depends(require_shop), db: Session = Depends(get_db),
+):
+    deal = _owned_deal(db, shop, deal_id)
+    form = dict(title=title, category=category, area=area, old_price=old_price, new_price=new_price,
+                link=link, ends_on=ends_on)
+    data, errors = validate_deal(shop.name, title, category, area, old_price, new_price, link, shop.local_phone)
+    ends, ends_ok = parse_optional_date(ends_on)
+    if not ends_ok:
+        errors.append("تاريخ انتهاء العرض غير صحيح")
+    data["ends_on"] = ends
+    old_image = None
+    if not errors and image and image.filename:
+        try:
+            data["image_path"] = save_image(image)
+            old_image = deal.image_path
+        except ValueError as e:
+            errors.append(str(e))
+    if errors:
+        return _shop_deal_page(shop, form, errors, deal, 400)
+
+    for key, value in data.items():
+        setattr(deal, key, value)
+    if not shop.trusted:
+        deal.is_approved = False  # تعديل محل غير موثوق يعود للمراجعة
+    db.commit()
+    if old_image:
+        delete_image(old_image)
+    base = site_base(request)
+    if shop.trusted:
+        background.add_task(tg_admin, f"✏️ عدّل محل موثوق عرضه\n{shop.name} — {deal.title}\n{base}/deal/{deal.id}")
+        return RedirectResponse("/shop?ok=deal", status_code=303)
+    background.add_task(notify_admin, deal.id, base)
+    return RedirectResponse("/shop?ok=pending", status_code=303)
+
+
+@app.post("/shop/deals/{deal_id}/delete")
+def shop_deal_delete(deal_id: DealId, shop: Shop = Depends(require_shop), db: Session = Depends(get_db)):
+    deal = _owned_deal(db, shop, deal_id)
+    image = deal.image_path
+    db.execute(delete(ClickEvent).where(ClickEvent.deal_id == deal.id))
+    db.delete(deal)
+    db.commit()
+    delete_image(image)
+    return RedirectResponse("/shop?ok=deleted", status_code=303)
+
+
+def _pay_page(shop: Shop, db: Session, form: dict, errors: list[str], status: int = 200):
+    pending = db.scalar(select(Payment).where(Payment.shop_id == shop.id, Payment.status == "pending"))
+    return render("shop_pay.html", status, shop=shop, pending=pending, form=form, errors=errors,
+                  zaincash=ZAINCASH_NUMBER, vip_limit=PLAN_LIMITS["vip"], plan_names=PLAN_NAMES)
+
+
+@app.get("/shop/pay", response_class=HTMLResponse)
+def shop_pay_page(shop: Shop = Depends(require_shop), db: Session = Depends(get_db)):
+    if not shop.verified:
+        return RedirectResponse("/shop", status_code=303)
+    return _pay_page(shop, db, {"plan": "", "txn_ref": ""}, [])
+
+
+@app.post("/shop/pay")
+def shop_pay(
+    request: Request, background: BackgroundTasks,
+    plan: str = Form(""), txn_ref: str = Form(""), proof: Optional[UploadFile] = File(None),
+    shop: Shop = Depends(require_shop), db: Session = Depends(get_db),
+):
+    if not shop.verified:
+        return RedirectResponse("/shop", status_code=303)
+    if db.scalar(select(Payment.id).where(Payment.shop_id == shop.id, Payment.status == "pending")):
+        return RedirectResponse("/shop/pay", status_code=303)  # طلب واحد قيد المراجعة يكفي
+    form = {"plan": plan, "txn_ref": txn_ref}
+    txn_ref = " ".join(txn_ref.split())[:60]
+    errors = []
+    if plan not in PLAN_LIMITS:
+        errors.append("اختر الباقة")
+    has_proof = bool(proof and proof.filename)
+    if not txn_ref and not has_proof:
+        errors.append("اكتب رقم العملية أو ارفع صورة الإيصال")
+    proof_path = ""
+    if not errors and has_proof:
+        try:
+            proof_path = save_image(proof, PROOF_DIR)
+        except ValueError as e:
+            errors.append(str(e))
+    if errors:
+        return _pay_page(shop, db, form, errors, 400)
+
+    amount = VIP_PRICE if plan == "vip" else BASIC_PRICE
+    db.add(Payment(shop_id=shop.id, plan=plan, amount=amount, txn_ref=txn_ref, proof_path=proof_path))
+    db.commit()
+    background.add_task(tg_admin, f"💰 طلب اشتراك ينتظر تأكيدك\n{shop.name} ({shop.local_phone})\n"
+                                  f"باقة {PLAN_NAMES[plan]} — {amount:,} د.ع\n"
+                                  f"{'رقم العملية: ' + txn_ref if txn_ref else 'مرفق صورة إيصال'}\n\n"
+                                  f"{site_base(request)}/admin")
+    return RedirectResponse("/shop?ok=paid", status_code=303)
+
+
+# ── بوت تيليغرام: تأكيد رقم المحل آلياً ──
+
+@app.post("/tg/webhook/{secret}")
+def tg_webhook(secret: str, update_: dict = Body(...), db: Session = Depends(get_db)):
+    """يستقبل رسائل البوت. المسار نفسه سرّ مشتق من التوكن، فلا يقبل إلا طلبات تيليغرام."""
+    if not TELEGRAM_BOT_TOKEN or not hmac.compare_digest(secret.encode(), WEBHOOK_SECRET.encode()):
+        raise HTTPException(404)
+    msg = update_.get("message") or {}
+    chat_id = str((msg.get("chat") or {}).get("id") or "")
+    if not chat_id or (msg.get("chat") or {}).get("type") != "private":
+        return {"ok": True}
+    text_ = (msg.get("text") or "").strip()
+    contact = msg.get("contact")
+    base = PUBLIC_URL
+    share_button = {"keyboard": [[{"text": "📱 مشاركة رقمي للتأكيد", "request_contact": True}]],
+                    "resize_keyboard": True, "one_time_keyboard": True}
+
+    if text_.startswith("/start"):
+        arg = text_[6:].strip()
+        shop = None
+        if arg.startswith("v") and len(arg) > 1:
+            shop = db.scalar(select(Shop).where(Shop.verify_code == arg[1:]))
+        if shop and shop.verified:
+            # حساب أكّدته الإدارة يدوياً: نربطه بتيليغرام لتصله الإشعارات. الرمز يظهر في بوابته فقط.
+            shop.tg_chat_id, shop.verify_code = chat_id, ""
+            db.commit()
+            tg_send(chat_id, f"✅ تم ربط حساب {shop.name} بتيليغرام.\nستصلك هنا إشعارات العروض وتذكير التجديد.")
+        elif shop:
+            shop.tg_chat_id = chat_id
+            db.commit()
+            tg_send(chat_id, f"أهلاً {shop.name} 👋\nاضغط الزر بالأسفل لمشاركة رقمك، حتى نتأكد أنه "
+                             f"الرقم المسجّل في {SITE_NAME}.", reply_markup=share_button)
+        else:
+            known = db.scalar(select(Shop).where(Shop.tg_chat_id == chat_id, Shop.verified.is_(True)))
+            if known:
+                tg_send(chat_id, f"أهلاً {known.name} 👋 حسابك مؤكد.\nبوابتك: {base}/shop")
+            else:
+                tg_send(chat_id, f"أهلاً بك في {SITE_NAME} 👋\nلتسجيل محلك ونشر عروضك: {base}/shop/register")
+    elif contact:
+        shop = db.scalar(select(Shop).where(Shop.tg_chat_id == chat_id, Shop.verified.is_(False))
+                         .order_by(Shop.id.desc()))
+        # تيليغرام يضع user_id صاحب الرقم: نقبل فقط رقم المرسل نفسه، لا رقماً من جهات اتصاله
+        own = str(contact.get("user_id") or "") == str((msg.get("from") or {}).get("id") or "-")
+        if not shop:
+            tg_send(chat_id, f"لا يوجد حساب ينتظر التأكيد. سجّل من: {base}/shop/register")
+        elif not own:
+            tg_send(chat_id, "شارك رقمك أنت من الزر بالأسفل، لا رقماً من جهات الاتصال.", reply_markup=share_button)
+        elif normalize_phone(contact.get("phone_number") or "") != shop.phone:
+            tg_send(chat_id, f"رقم تيليغرام هذا لا يطابق الرقم المسجّل ({shop.local_phone}).\n"
+                             f"سجّل برقم تيليغرام نفسه، أو افتح البوت من الحساب الصحيح.")
+        else:
+            shop.verified, shop.verify_code = True, ""
+            db.commit()
+            tg_send(chat_id, f"✅ تم تأكيد حسابك يا {shop.name}.\nأضف أول عرض الآن: {base}/shop\n\n"
+                             f"ستصلك هنا إشعارات قبول العروض وتذكير التجديد.",
+                    reply_markup={"remove_keyboard": True})
+    return {"ok": True}
+
+
+def setup_telegram() -> None:
+    """عند التشغيل: يجلب اسم البوت ويسجّل عنوان استقبال الرسائل عند تيليغرام."""
+    global BOT_USERNAME
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        if not BOT_USERNAME:
+            with urllib.request.urlopen(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe", timeout=10) as resp:
+                BOT_USERNAME = json.load(resp)["result"]["username"]
+        if PUBLIC_URL:
+            telegram_call("setWebhook", {"url": f"{PUBLIC_URL}/tg/webhook/{WEBHOOK_SECRET}",
+                                         "allowed_updates": ["message"]})
+    except Exception as e:
+        print(f"[telegram] setup failed: {type(e).__name__}")
+
+
+def _background_loop() -> None:
+    setup_telegram()
+    while True:
+        try:
+            run_reminders()
+        except Exception as e:
+            print(f"[reminders] failed: {type(e).__name__}")
+        time.sleep(3600)
+
+
+@app.on_event("startup")
+def _start_background() -> None:
+    threading.Thread(target=_background_loop, daemon=True).start()
+
+
 # ── لوحة الإدارة ──
 
 @app.get("/admin/login", response_class=HTMLResponse)
@@ -1614,6 +2550,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
     deals = db.scalars(
         select(Deal).order_by(Deal.is_approved.asc(), Deal.is_vip.desc(), Deal.created_at.desc())
     ).all()
+    shops = db.scalars(select(Shop).order_by(Shop.verified.asc(), Shop.created_at.desc())).all()
     cutoff = utcnow() - timedelta(days=30)
     clicks_30d = dict(db.execute(
         select(ClickEvent.deal_id, func.count()).where(ClickEvent.created_at >= cutoff)
@@ -1626,8 +2563,15 @@ def admin_dashboard(db: Session = Depends(get_db)):
         clicks=sum(d.clicks_count for d in deals),
         clicks_30d=sum(clicks_30d.values()),
         # الدخل الشهري = اشتراكات سارية لعروض منشورة
-        mrr=sum(d.monthly_fee for d in deals if d.is_approved and d.is_paid),
+        # المحل يدفع مرة واحدة مهما كان عدد عروضه؛ والعروض القديمة بلا محل تُحسب كل واحد لوحده
+        mrr=sum(d.monthly_fee for d in deals if d.is_approved and d.is_paid and not d.shop_id)
+            + sum(s.monthly_fee for s in shops if s.is_paid),
     )
+    payments = db.execute(
+        select(Payment, Shop).join(Shop, Shop.id == Payment.shop_id).where(Payment.status == "pending")
+        .order_by(Payment.created_at.asc())).all()
+    deal_counts = dict(db.execute(
+        select(Deal.shop_id, func.count()).where(Deal.shop_id.is_not(None)).group_by(Deal.shop_id)).all())
 
     # مصادر الزوار والنقرات خلال آخر 30 يوماً
     visits_by_src = dict(db.execute(
@@ -1650,6 +2594,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
                   tg_channel=bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL),
                   tg_admin=bool(TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_CHAT),
                   trial_days=TRIAL_DAYS, grace_days=GRACE_DAYS,
+                  shops=shops, payments=payments, deal_counts=deal_counts, plan_names=PLAN_NAMES,
+                  bot_ready=bool(bot_url()),
                   goal_percent=min(100, stats["mrr"] * 100 // MONTHLY_GOAL))
 
 
@@ -1666,8 +2612,20 @@ def admin_toggle_approve(deal_id: DealId, request: Request, background: Backgrou
     deal = _get_deal(db, deal_id)
     deal.is_approved = not deal.is_approved
     if deal.is_approved:
-        start_trial(deal)  # الموافقة تبدأ الشهر المجاني تلقائياً
-        background.add_task(announce_deal, deal.id, site_base(request))
+        base = site_base(request)
+        shop = db.get(Shop, deal.shop_id) if deal.shop_id else None
+        if shop:
+            # قبول أول عرض لمحل: يصير موثوقاً (عروضه التالية تُنشر مباشرة) ويبدأ شهره المجاني
+            first = not shop.trusted
+            shop.trusted = True
+            shop_start_trial(shop)
+            sync_shop_deals(db, shop)
+            background.add_task(tg_send, shop.tg_chat_id,
+                                f"✅ تم قبول عرضك «{deal.title}» وهو منشور الآن:\n{base}/deal/{deal.id}"
+                                + ("\n\n🎁 شهرك المجاني بدأ اليوم، وعروضك القادمة تُنشر مباشرة." if first else ""))
+        else:
+            start_trial(deal)  # الموافقة تبدأ الشهر المجاني تلقائياً
+        background.add_task(announce_deal, deal.id, base)
     db.commit()
     return RedirectResponse("/admin", status_code=303)
 
@@ -1675,7 +2633,12 @@ def admin_toggle_approve(deal_id: DealId, request: Request, background: Backgrou
 @app.post("/admin/deals/{deal_id}/vip", dependencies=[Depends(require_admin)])
 def admin_toggle_vip(deal_id: DealId, db: Session = Depends(get_db)):
     deal = _get_deal(db, deal_id)
-    deal.is_vip = not deal.is_vip
+    shop = db.get(Shop, deal.shop_id) if deal.shop_id else None
+    if shop:  # الباقة على مستوى المحل: تتغير لكل عروضه معاً
+        shop.is_vip = not shop.is_vip
+        sync_shop_deals(db, shop)
+    else:
+        deal.is_vip = not deal.is_vip
     db.commit()
     return RedirectResponse("/admin", status_code=303)
 
@@ -1688,8 +2651,13 @@ def admin_renew(deal_id: DealId, request: Request, background: BackgroundTasks,
     من يدفع أثناء شهره المجاني لا يخسر أيامه الباقية. والعرض المخفي يعود للظهور فوراً.
     """
     deal = _get_deal(db, deal_id)
-    start = max(deal.active_until or today(), today())
-    deal.paid_until = start + timedelta(days=SUBSCRIPTION_DAYS)
+    shop = db.get(Shop, deal.shop_id) if deal.shop_id else None
+    if shop:
+        shop.trusted = True
+        renew_shop(db, shop, shop.is_vip)
+    else:
+        start = max(deal.active_until or today(), today())
+        deal.paid_until = start + timedelta(days=SUBSCRIPTION_DAYS)
     deal.is_approved = True
     db.commit()
     background.add_task(announce_deal, deal.id, site_base(request))
@@ -1705,6 +2673,93 @@ def admin_delete(deal_id: DealId, db: Session = Depends(get_db)):
     db.delete(deal)
     db.commit()
     delete_image(image)
+    return RedirectResponse("/admin", status_code=303)
+
+
+# ── إدارة المحلات والدفعات ──
+
+ShopId = Annotated[int, PathParam(ge=1, le=2_147_483_647)]
+
+
+def _get_shop(db: Session, shop_id: int) -> Shop:
+    shop = db.get(Shop, shop_id)
+    if not shop:
+        raise HTTPException(404)
+    return shop
+
+
+@app.post("/admin/shops/{shop_id}/verify", dependencies=[Depends(require_admin)])
+def admin_shop_verify(shop_id: ShopId, db: Session = Depends(get_db)):
+    """تأكيد يدوي لمحل ليس عنده تيليغرام (بعد أن تتأكد من رقمه بنفسك، مثلاً برسالة واتساب منه)."""
+    shop = _get_shop(db, shop_id)
+    shop.verified = True  # نُبقي verify_code ليربط حسابه بالبوت لاحقاً إن أراد
+    db.commit()
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/shops/{shop_id}/trust", dependencies=[Depends(require_admin)])
+def admin_shop_trust(shop_id: ShopId, db: Session = Depends(get_db)):
+    shop = _get_shop(db, shop_id)
+    shop.trusted = not shop.trusted
+    db.commit()
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/shops/{shop_id}/reset", response_class=HTMLResponse, dependencies=[Depends(require_admin)])
+def admin_shop_reset(shop_id: ShopId, request: Request, db: Session = Depends(get_db)):
+    shop = _get_shop(db, shop_id)
+    link = make_reset_link(db, shop, site_base(request))
+    return render("admin_link.html", shop=shop, link=link, minutes=RESET_MINUTES)
+
+
+@app.post("/admin/shops/{shop_id}/delete", dependencies=[Depends(require_admin)])
+def admin_shop_delete(shop_id: ShopId, db: Session = Depends(get_db)):
+    """يحذف المحل وكل عروضه وصورها وطلبات دفعه (لحسابات السبام أو بطلب صاحبها)."""
+    shop = _get_shop(db, shop_id)
+    deals = db.scalars(select(Deal).where(Deal.shop_id == shop.id)).all()
+    payments = db.scalars(select(Payment).where(Payment.shop_id == shop.id)).all()
+    images = [d.image_path for d in deals] + [p.proof_path for p in payments]
+    if deals:
+        db.execute(delete(ClickEvent).where(ClickEvent.deal_id.in_([d.id for d in deals])))
+    for row in [*deals, *payments, shop]:
+        db.delete(row)
+    db.commit()
+    for name in images:
+        delete_image(name)
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.get("/admin/proofs/{name}", dependencies=[Depends(require_admin)])
+def admin_proof(name: str):
+    """صورة إيصال الدفع: للمدير فقط، وليست ضمن الملفات العامة."""
+    if not re.fullmatch(r"[a-f0-9]{32}\.webp", name) or not (PROOF_DIR / name).is_file():
+        raise HTTPException(404)
+    return FileResponse(PROOF_DIR / name, media_type="image/webp")
+
+
+@app.post("/admin/payments/{payment_id}/{decision}", dependencies=[Depends(require_admin)])
+def admin_payment_decide(payment_id: ShopId, decision: str, request: Request, background: BackgroundTasks,
+                         db: Session = Depends(get_db)):
+    payment = db.get(Payment, payment_id)
+    if not payment or decision not in ("approve", "reject") or payment.status != "pending":
+        raise HTTPException(404)  # طلب قُرِّر سابقاً لا يُنفَّذ مرتين
+    shop = _get_shop(db, payment.shop_id)
+    base = site_base(request)
+    if decision == "approve":
+        payment.status = "approved"
+        renew_shop(db, shop, vip=payment.plan == "vip")
+        db.commit()
+        background.add_task(tg_send, shop.tg_chat_id,
+                            f"✅ تم تأكيد دفعتك. باقة {PLAN_NAMES[payment.plan]} مفعّلة حتى {shop.paid_until}.\n{base}/shop")
+        # عروضه التي كانت مخفية لانتهاء المدة عادت للظهور: نعلن عمّا لم يُنشر في القناة بعد
+        for deal_id in db.scalars(select(Deal.id).where(Deal.shop_id == shop.id, Deal.is_approved.is_(True))).all():
+            background.add_task(announce_deal, deal_id, base)
+    else:
+        payment.status = "rejected"
+        db.commit()
+        background.add_task(tg_send, shop.tg_chat_id,
+                            f"⚠️ لم نتمكن من تأكيد دفعتك (باقة {PLAN_NAMES[payment.plan]}). "
+                            f"تأكد من رقم العملية وأرسل الطلب من جديد:\n{base}/shop/pay")
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -1770,7 +2825,16 @@ def admin_edit(
         setattr(deal, key, value)
     deal.is_approved = bool(is_approved)
     deal.is_vip = bool(is_vip)
-    if newly_published:
+    shop = db.get(Shop, deal.shop_id) if deal.shop_id else None
+    if shop:
+        # عرض تابع لمحل: التواريخ والباقة تُحفظ على المحل وتُنسخ لكل عروضه
+        shop.trial_until, shop.paid_until, shop.is_vip = deal.trial_until, deal.paid_until, deal.is_vip
+        if newly_published:
+            shop.trusted = True
+            shop_start_trial(shop)
+        sync_shop_deals(db, shop)
+        deal.shop_name = shop.name
+    elif newly_published:
         start_trial(deal)  # فقط عند أول نشر: مسح التاريخين يدوياً يجعل العرض دائماً
     db.commit()
     if old_image:
