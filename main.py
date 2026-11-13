@@ -18,6 +18,7 @@
 
 import hashlib
 import hmac
+from html import escape as html_escape
 import json
 import os
 import re
@@ -101,6 +102,7 @@ MAX_BODY_BYTES = MAX_IMAGE_BYTES + 1024 * 1024
 PAGE_SIZE = 40
 SORTS = {"": "الأحدث", "discount": "الأكثر خصماً", "price": "الأقل سعراً"}
 HOT_MIN_CLICKS = 3  # أقل عدد نقرات في 7 أيام ليحمل العرض شارة «الأكثر طلباً»
+VIEWED_COOKIE = "vw"  # العروض التي شاهد الزائر صفحتها مؤخراً
 CLICKED_COOKIE = "clk"  # العروض التي ضغطها الزائر مؤخراً، حتى لا تُحسب النقرة المكررة
 
 # الباقات والهدف الشهري
@@ -192,6 +194,7 @@ class Deal(Base):
     trial_until: Mapped[Optional[date]] = mapped_column(Date, nullable=True)  # نهاية الشهر المجاني
     tg_posted: Mapped[bool] = mapped_column(Boolean, default=False)  # نُشر في قناة تيليغرام
     shop_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)  # صاحبه في البوابة
+    paused: Mapped[bool] = mapped_column(Boolean, default=False)  # أوقفه صاحب المحل مؤقتاً
 
     @property
     def active_until(self) -> Optional[date]:
@@ -268,6 +271,17 @@ class Visit(Base):
     count: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class DealView(Base):
+    """مشاهدات صفحة العرض يومياً (زائر واحد = مرة كل 6 ساعات). مع النقرات تعطي «نسبة الطلب»."""
+
+    __tablename__ = "deal_views"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    deal_id: Mapped[int] = mapped_column(Integer, index=True)
+    day: Mapped[date] = mapped_column(Date, index=True)
+    count: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class Shop(Base):
     """حساب صاحب المحل في بوابة المحلات. الاشتراك يُدار هنا ويُنسخ إلى عروض المحل."""
 
@@ -336,7 +350,8 @@ def ensure_columns() -> None:
     """ترقية بسيطة لقواعد البيانات القديمة: يضيف الأعمدة الجديدة إن لم تكن موجودة."""
     wanted = {
         "deals": {"paid_until": "DATE", "ends_on": "DATE", "trial_until": "DATE",
-                  "tg_posted": "BOOLEAN DEFAULT FALSE", "shop_id": "INTEGER"},
+                  "tg_posted": "BOOLEAN DEFAULT FALSE", "shop_id": "INTEGER",
+                  "paused": "BOOLEAN DEFAULT FALSE"},
         "click_events": {"source": "VARCHAR(20) DEFAULT 'direct'"},
     }
     insp = inspect(engine)
@@ -359,6 +374,7 @@ def live_deal():
     cutoff = today() - timedelta(days=GRACE_DAYS)
     active = func.coalesce(Deal.paid_until, Deal.trial_until)
     return and_(
+        or_(Deal.paused.is_(None), Deal.paused.is_(False)),
         or_(Deal.ends_on.is_(None), Deal.ends_on >= today()),
         or_(active.is_(None), active >= cutoff),
     )
@@ -366,6 +382,8 @@ def live_deal():
 
 def live(deal: "Deal") -> bool:
     """نفس شرط live_deal لكن على عرض واحد محمّل."""
+    if deal.paused:
+        return False
     if deal.ends_on is not None and deal.ends_on < today():
         return False
     until = deal.active_until
@@ -788,7 +806,9 @@ TEMPLATES = {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}{{ site_name }} — أقوى عروض وتخفيضات الموصل اليومية{% endblock %}</title>
-<meta name="description" content="أقوى عروض وتخفيضات محلات ومطاعم وبيجات الموصل في مكان واحد، محدّثة يومياً.">
+<meta name="description" content="{% block description %}أقوى عروض وتخفيضات محلات ومطاعم وبيجات الموصل في مكان واحد، محدّثة يومياً.{% endblock %}">
+{% if canonical %}<link rel="canonical" href="{{ canonical }}">{% endif %}
+{% if noindex %}<meta name="robots" content="noindex">{% endif %}
 <meta name="theme-color" content="#0a0a0f">
 {% block og %}
 <meta property="og:title" content="{{ site_name }} — أقوى عروض وتخفيضات الموصل اليومية">
@@ -890,6 +910,9 @@ document.addEventListener('click',function(e){
 {% endmacro %}""",
     "home.html": """{% extends "base.html" %}
 {% from "macros.html" import card %}
+{% set place = (' في ' ~ area) if area and area != citywide else (' مع توصيل لكل الموصل' if area else ' في الموصل') %}
+{% block title %}{% if category or area %}عروض {{ category or 'وتخفيضات' }}{{ place }} — {{ site_name }}{% else %}{{ super() }}{% endif %}{% endblock %}
+{% block description %}{% if category or area %}أقوى عروض {{ category or 'المحلات والمطاعم والبيجات' }}{{ place }} اليوم، بالأسعار قبل وبعد الخصم. اختر العرض واطلبه مباشرة من المحل.{% else %}{{ super() }}{% endif %}{% endblock %}
 {% macro chip(label, url, active) %}
 <a href="{{ url }}" {{ 'data-active aria-current=true' if active }} class="shrink-0 rounded-full px-3.5 py-2 text-sm font-bold border transition active:scale-95
   {{ 'bg-white text-slate-900 border-white' if active else 'bg-white/5 text-slate-300 border-white/10' }}">{{ label }}</a>
@@ -1406,6 +1429,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
         <p class="text-xs text-slate-400 mt-1">{{ d.new_price | price }} د.ع <span class="line-through text-slate-500">{{ d.old_price | price }}</span> <span dir="ltr">(-{{ d.discount_percent }}%)</span></p>
         <p class="text-xs font-bold mt-1">
           {% if not d.is_approved %}<span class="text-amber-300">⏳ بانتظار المراجعة</span>
+          {% elif d.paused %}<span class="text-slate-300">⏸ موقوف مؤقتاً — لا يظهر للزوار</span>
           {% elif not d.is_live %}<span class="text-rose-400">⛔ مخفي — {{ 'انتهى تاريخ العرض' if d.ends_on and d.ends_on < today else 'انتهت المدة، جدّد ليظهر' }}</span>
           {% else %}<span class="text-emerald-300">● منشور</span>{% endif %}
         </p>
@@ -1415,9 +1439,16 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
         <p class="text-[10px] text-slate-400">نقرة / 30 يوم</p>
       </div>
     </div>
+    {% set v = views_30d.get(d.id, 0) %}
+    <p class="mt-2 text-[11px] text-slate-400">👁 {{ v | price }} مشاهدة لصفحة العرض خلال 30 يوماً
+      {% if v >= 10 %}· نسبة الطلب <b class="text-white" dir="ltr">{{ (clicks_30d.get(d.id, 0) * 100 / v) | round | int }}%</b>{% endif %}</p>
     <div class="mt-2 flex flex-wrap gap-2">
       <a href="/shop/deals/{{ d.id }}/edit" class="text-xs font-bold rounded-lg px-3 py-2 border border-white/15 text-slate-200">تعديل</a>
-      {% if d.is_approved and d.is_live %}<a href="/deal/{{ d.id }}" target="_blank" class="text-xs font-bold rounded-lg px-3 py-2 border border-white/15 text-slate-200">عرض في الموقع</a>{% endif %}
+      {% if d.is_approved %}
+      <form method="post" action="/shop/deals/{{ d.id }}/pause">
+        <button class="text-xs font-bold rounded-lg px-3 py-2 border border-white/15 text-slate-200">{{ '▶ تشغيل العرض' if d.paused else '⏸ إيقاف مؤقت' }}</button></form>
+      {% endif %}
+      <a href="/deal/{{ d.id }}" target="_blank" class="text-xs font-bold rounded-lg px-3 py-2 border border-white/15 text-slate-200">{{ 'عرض في الموقع' if d.is_approved and d.is_live else 'معاينة' }}</a>
       <form method="post" action="/shop/deals/{{ d.id }}/delete" onsubmit="return confirm('حذف هذا العرض نهائياً؟')">
         <button class="text-xs font-bold rounded-lg px-3 py-2 border border-rose-400/40 text-rose-300">حذف</button></form>
     </div>
@@ -1642,9 +1673,13 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   </ul>
 </details>
 
+<input id="admin_search" type="search" placeholder="🔍 ابحث باسم المحل أو العرض أو الرقم…"
+       class="mt-3 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-rose-500">
+
 <section class="mt-3 space-y-3">
   {% for d in deals %}
   <div data-deal data-status="{{ 'live' if d.is_approved else 'pending' }}" data-vip="{{ 1 if d.is_vip else 0 }}"
+       data-text="{{ (d.shop_name ~ ' ' ~ d.title ~ ' ' ~ d.area ~ ' ' ~ d.category ~ ' ' ~ d.contact_phone) | lower }}"
        data-expiring="{{ 1 if d.active_until is not none and d.days_left <= warn_days else 0 }}"
        class="bg-white rounded-2xl p-3 border {{ 'border-slate-100' if d.is_approved else 'border-rose-300 bg-rose-50/40' }}">
     <div class="flex gap-3">
@@ -1664,11 +1699,13 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
         <p class="text-xl font-extrabold text-emerald-600">{{ d.clicks_count | price }}</p>
         <p class="text-[10px] text-slate-500">نقرة</p>
         <p class="text-[10px] text-slate-400 mt-1">{{ clicks_30d.get(d.id, 0) }} / 30 يوم</p>
+        <p class="text-[10px] text-slate-400">👁 {{ views_30d.get(d.id, 0) }}</p>
       </div>
     </div>
     <p class="text-[11px] text-slate-400 mt-2 truncate" dir="ltr">{{ d.link_url }}{% if d.contact_phone %} · ☎ {{ d.contact_phone }}{% endif %} · {{ d.created_at.strftime('%Y-%m-%d') }}</p>
     <p class="text-xs font-bold mt-1">
-      {% if d.is_approved and not d.is_live %}<span class="bg-slate-800 text-white rounded px-1.5 py-0.5">مخفي تلقائياً</span>{% endif %}
+      {% if d.paused %}<span class="bg-slate-500 text-white rounded px-1.5 py-0.5">⏸ أوقفه المحل</span>
+      {% elif d.is_approved and not d.is_live %}<span class="bg-slate-800 text-white rounded px-1.5 py-0.5">مخفي تلقائياً</span>{% endif %}
       {% if d.paid_until is not none %}
         {% if d.days_left < 0 %}<span class="text-rose-600">⛔ انتهى الاشتراك منذ {{ -d.days_left }} يوم</span>
         {% elif d.days_left <= warn_days %}<span class="text-amber-600">⏳ الاشتراك ينتهي خلال {{ d.days_left }} يوم</span>
@@ -1717,6 +1754,13 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
     try{sessionStorage.setItem('adminTab',key)}catch(e){}
   }
   tabs.forEach(function(t){t.addEventListener('click',function(){show(t.dataset.tab)})});
+  var search=document.getElementById('admin_search');
+  if(search){search.addEventListener('input',function(){
+    var q=search.value.trim().toLowerCase();
+    if(q){tabs.forEach(function(t){t.classList.remove('bg-slate-900','text-white')});}
+    deals.forEach(function(d){d.classList.toggle('hidden', q ? d.dataset.text.indexOf(q)===-1 : false)});
+    if(!q){show('all')}
+  });}
   document.addEventListener('click',function(e){
     var b=e.target.closest('[data-copy]'); if(!b||!navigator.clipboard)return;
     navigator.clipboard.writeText(b.dataset.copy).then(function(){
@@ -1743,6 +1787,7 @@ def render(name: str, status_code: int = 200, **ctx) -> HTMLResponse:
     ctx.setdefault("contact_wa", normalize_phone(CONTACT_WHATSAPP))
     ctx.setdefault("basic_price", BASIC_PRICE)
     ctx.setdefault("vip_price", VIP_PRICE)
+    ctx.setdefault("citywide", CITYWIDE)
     return HTMLResponse(jinja.get_template(name).render(**ctx), status_code=status_code)
 
 
@@ -1859,7 +1904,10 @@ def robots(request: Request):
 def sitemap(request: Request, db: Session = Depends(get_db)):
     base = str(request.base_url).rstrip("/")
     ids = db.scalars(select(Deal.id).where(Deal.is_approved.is_(True), live_deal())).all()
-    urls = [f"{base}/", f"{base}/join", f"{base}/about", f"{base}/terms"] + [f"{base}/deal/{i}" for i in ids]
+    # صفحات المناطق والفئات: كل واحدة لها عنوان ووصف خاص، فتظهر في بحث «عروض مطاعم الزهور» وأمثاله
+    filters = [filter_url(area=a) for a in AREAS] + [filter_url(category=c) for c in CATEGORIES]
+    urls = ([f"{base}/", f"{base}/join", f"{base}/about", f"{base}/terms"]
+            + [base + html_escape(f) for f in filters] + [f"{base}/deal/{i}" for i in ids])
     body = ['<?xml version="1.0" encoding="UTF-8"?>',
             '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
     body += [f"<url><loc>{u}</loc></url>" for u in urls]
@@ -1912,7 +1960,9 @@ def home(request: Request, area: str = "", category: str = "", page: int = 1, q:
     def furl(a=area, c=category, p=1, s=sort):
         return filter_url(a, c, p, s, q)
 
-    resp = render("home.html", deals=deals[:PAGE_SIZE], area=area, category=category, q=q, sort=sort,
+    # نسخة واحدة معتمدة لكل منطقة/فئة عند جوجل؛ ونتائج البحث لا تُفهرس
+    resp = render("home.html", canonical=site_base(request) + filter_url(area, category), noindex=bool(q),
+                  deals=deals[:PAGE_SIZE], area=area, category=category, q=q, sort=sort,
                   total=total, shops=shops, best_discount=round(best or 0), hot_ids=hot_ids,
                   furl=furl, sorts=SORTS,
                   prev_url=furl(p=page - 1) if page > 1 else "",
@@ -1942,7 +1992,10 @@ def deal_jsonld(deal: "Deal", base: str) -> str:
 @app.get("/deal/{deal_id}", response_class=HTMLResponse)
 def deal_page(deal_id: DealId, request: Request, db: Session = Depends(get_db)):
     deal = db.get(Deal, deal_id)
-    if not deal or not (is_admin(request) or (deal.is_approved and live(deal))):
+    admin = is_admin(request)
+    owner = deal is not None and deal.shop_id is not None and (
+        (shop := current_shop(request, db)) is not None and shop.id == deal.shop_id)
+    if not deal or not (admin or owner or (deal.is_approved and live(deal))):
         raise HTTPException(404)  # العرض المنتهي يُعامل كغير موجود للزوّار: الرسالة تشرح ذلك
     similar = db.scalars(
         select(Deal)
@@ -1955,7 +2008,35 @@ def deal_page(deal_id: DealId, request: Request, db: Session = Depends(get_db)):
                   og_image=base + deal.image_url, og_url=f"{base}/deal/{deal.id}",
                   jsonld=deal_jsonld(deal, base))
     track_visit(request, resp, db)
+    if not (admin or owner):
+        count_view(request, resp, db, deal.id)
     return resp
+
+
+def count_view(request: Request, response, db: Session, deal_id: int) -> None:
+    """يحسب مشاهدة واحدة لكل زائر لكل عرض كل 6 ساعات (بدون الروبوتات)."""
+    if BOT_RE.search(request.headers.get("user-agent", "")):
+        return
+    seen = [c for c in request.cookies.get(VIEWED_COOKIE, "").split(".") if c.isascii() and c.isdigit()]
+    if str(deal_id) in seen:
+        return
+    day = today()
+    updated = db.execute(update(DealView).where(DealView.deal_id == deal_id, DealView.day == day)
+                         .values(count=DealView.count + 1)).rowcount
+    if not updated:
+        db.add(DealView(deal_id=deal_id, day=day, count=1))
+    db.commit()
+    response.set_cookie(VIEWED_COOKIE, ".".join((seen + [str(deal_id)])[-60:]),
+                        max_age=6 * 3600, httponly=True, samesite="lax")
+
+
+def views_since(db: Session, days: int, ids: Optional[list[int]] = None) -> dict:
+    stmt = select(DealView.deal_id, func.sum(DealView.count)).where(DealView.day >= today() - timedelta(days=days))
+    if ids is not None:
+        if not ids:
+            return {}
+        stmt = stmt.where(DealView.deal_id.in_(ids))
+    return {k: int(v) for k, v in db.execute(stmt.group_by(DealView.deal_id)).all()}
 
 
 # ── تتبع النقرات ──
@@ -1973,6 +2054,9 @@ def go(deal_id: DealId, request: Request, db: Session = Depends(get_db)):
     clicked = [c for c in request.cookies.get(CLICKED_COOKIE, "").split(".") if c.isascii() and c.isdigit()]
     if not is_bot and not is_admin(request) and str(deal_id) not in clicked:
         db.execute(update(Deal).where(Deal.id == deal_id).values(clicks_count=Deal.clicks_count + 1))
+        # زر «اطلب العرض» في البطاقة يتجاوز صفحة العرض: النقر يعني أن الزائر رأى العرض
+        if str(deal_id) not in request.cookies.get(VIEWED_COOKIE, "").split("."):
+            count_view(request, resp, db, deal_id)
         source = clean_source(request.cookies.get(SRC_COOKIE)) or "direct"
         db.add(ClickEvent(deal_id=deal_id, source=source))
         db.commit()
@@ -2230,12 +2314,15 @@ def shop_home(request: Request, ok: str = "", shop: Shop = Depends(require_shop)
             .group_by(ClickEvent.deal_id)).all())
 
     clicks_30d = clicks_since(30)
+    views_30d = views_since(db, 30, ids)
     stats = dict(d7=sum(clicks_since(7).values()), d30=sum(clicks_30d.values()),
                  total=sum(d.clicks_count for d in deals))
     pending_payment = db.scalar(select(Payment).where(Payment.shop_id == shop.id, Payment.status == "pending"))
     notice = {"deal": "تم حفظ العرض.", "pending": "وصلنا عرضك وسيُنشر بعد مراجعة سريعة.",
-              "deleted": "تم حذف العرض.", "paid": "وصلتنا تفاصيل دفعتك وسنؤكدها قريباً."}.get(ok, "")
-    resp = render("shop_home.html", shop=shop, deals=deals, clicks_30d=clicks_30d, stats=stats,
+              "deleted": "تم حذف العرض.", "paid": "وصلتنا تفاصيل دفعتك وسنؤكدها قريباً.",
+              "paused": "تم إيقاف العرض مؤقتاً. لا يظهر للزوار حتى تشغّله.",
+              "resumed": "عاد العرض للظهور."}.get(ok, "")
+    resp = render("shop_home.html", shop=shop, deals=deals, clicks_30d=clicks_30d, stats=stats, views_30d=views_30d,
                   pending_payment=pending_payment, notice=notice, today=today(),
                   vip_limit=PLAN_LIMITS["vip"], bot_url=bot_url(),
                   verify_url=bot_url("v" + shop.verify_code) if shop.verify_code else "")
@@ -2360,11 +2447,21 @@ def shop_deal_edit(
     return RedirectResponse("/shop?ok=pending", status_code=303)
 
 
+@app.post("/shop/deals/{deal_id}/pause")
+def shop_deal_pause(deal_id: DealId, shop: Shop = Depends(require_shop), db: Session = Depends(get_db)):
+    """إيقاف مؤقت (نفدت الكمية، المحل مغلق...) بدون حذف العرض ولا خسارة إحصائياته."""
+    deal = _owned_deal(db, shop, deal_id)
+    deal.paused = not deal.paused
+    db.commit()
+    return RedirectResponse(f"/shop?ok={'paused' if deal.paused else 'resumed'}", status_code=303)
+
+
 @app.post("/shop/deals/{deal_id}/delete")
 def shop_deal_delete(deal_id: DealId, shop: Shop = Depends(require_shop), db: Session = Depends(get_db)):
     deal = _owned_deal(db, shop, deal_id)
     image = deal.image_path
     db.execute(delete(ClickEvent).where(ClickEvent.deal_id == deal.id))
+    db.execute(delete(DealView).where(DealView.deal_id == deal.id))
     db.delete(deal)
     db.commit()
     delete_image(image)
@@ -2588,6 +2685,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
         key=lambda row: (-row[1], -row[2]),
     )
     messages = {d.id: stats_message(d, clicks_30d.get(d.id, 0)) for d in deals}
+    views_30d = views_since(db, 30)
 
     return render("admin.html", deals=deals, stats=stats, clicks_30d=clicks_30d, sources=sources,
                   messages=messages, goal=MONTHLY_GOAL, warn_days=EXPIRY_WARNING_DAYS, today=today(),
@@ -2595,6 +2693,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                   tg_admin=bool(TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_CHAT),
                   trial_days=TRIAL_DAYS, grace_days=GRACE_DAYS,
                   shops=shops, payments=payments, deal_counts=deal_counts, plan_names=PLAN_NAMES,
+                  views_30d=views_30d,
                   bot_ready=bool(bot_url()),
                   goal_percent=min(100, stats["mrr"] * 100 // MONTHLY_GOAL))
 
@@ -2670,6 +2769,7 @@ def admin_delete(deal_id: DealId, db: Session = Depends(get_db)):
     image = deal.image_path
     # نحذف سجل نقراته معه: SQLite قد يعيد استخدام الرقم لعرض جديد فيرث نقرات لم يحصل عليها
     db.execute(delete(ClickEvent).where(ClickEvent.deal_id == deal_id))
+    db.execute(delete(DealView).where(DealView.deal_id == deal_id))
     db.delete(deal)
     db.commit()
     delete_image(image)
@@ -2721,6 +2821,7 @@ def admin_shop_delete(shop_id: ShopId, db: Session = Depends(get_db)):
     images = [d.image_path for d in deals] + [p.proof_path for p in payments]
     if deals:
         db.execute(delete(ClickEvent).where(ClickEvent.deal_id.in_([d.id for d in deals])))
+        db.execute(delete(DealView).where(DealView.deal_id.in_([d.id for d in deals])))
     for row in [*deals, *payments, shop]:
         db.delete(row)
     db.commit()
