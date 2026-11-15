@@ -3,6 +3,7 @@ import io, os, sys, tempfile
 from datetime import timedelta
 
 os.environ["DATA_DIR"] = tempfile.mkdtemp()
+os.environ["LAUNCH_DATE"] = "2000-01-01"  # these suites test trials counted from today
 os.environ["ADMIN_PASSWORD"] = "test-pass-123"
 os.environ.pop("DATABASE_URL", None)
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

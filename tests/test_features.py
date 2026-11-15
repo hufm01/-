@@ -3,6 +3,7 @@ from datetime import timedelta
 
 d = tempfile.mkdtemp()
 os.environ["DATA_DIR"] = d
+os.environ["LAUNCH_DATE"] = "2000-01-01"  # these suites test trials counted from today
 os.environ["ADMIN_PASSWORD"] = "test-pass-123"
 os.environ["ZAINCASH_NUMBER"] = "07700000001"
 os.environ.pop("DATABASE_URL", None)

@@ -31,7 +31,7 @@ from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Annotated, Optional
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from fastapi import (BackgroundTasks, Body, Depends, FastAPI, File, Form, HTTPException, Request,
                      UploadFile)
@@ -43,7 +43,7 @@ from fastapi.staticfiles import StaticFiles
 from jinja2 import DictLoader, Environment, select_autoescape
 from PIL import Image, ImageOps
 from sqlalchemy import (Boolean, Date, DateTime, Integer, String, UniqueConstraint, and_, create_engine,
-                        delete, func, inspect, or_, select, text, update)
+                        delete, event, func, inspect, or_, select, text, update)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -112,6 +112,8 @@ MONTHLY_GOAL = 1_000_000
 SUBSCRIPTION_DAYS = 30
 EXPIRY_WARNING_DAYS = 5
 TRIAL_DAYS = 30   # الشهر المجاني يبدأ تلقائياً عند أول نشر للعرض
+# يوم الإطلاق: المحلات التي تُضاف قبله يبدأ شهرها المجاني منه، حتى يحصل كل محل على شهر كامل من الزوار
+LAUNCH_DATE = date.fromisoformat(os.getenv("LAUNCH_DATE") or "2026-12-01")
 GRACE_DAYS = 3    # مهلة بعد انتهاء المدة قبل أن يُخفى العرض تلقائياً
 
 # تيليغرام (اختياري): نشر تلقائي لكل عرض جديد في القناة، وتنبيه لك عند وصول عرض للمراجعة
@@ -129,6 +131,9 @@ PLAN_NAMES = {"basic": "الأساسية", "vip": "VIP"}
 SHOP_COOKIE = "shop_session"
 SHOP_SESSION_DAYS = 30
 RESET_MINUTES = 30
+CLAIM_DAYS = 7  # رابط استلام الحساب الذي ترسله الإدارة للمحل
+# الإضافة المجهولة عبر /submit مغلقة: المحلات تسجّل في البوابة (رقم مؤكد)، والإدارة تضيف مباشرة
+ALLOW_ANONYMOUS_SUBMIT = os.getenv("ALLOW_ANONYMOUS_SUBMIT", "") == "1"
 ZAINCASH_NUMBER = os.getenv("ZAINCASH_NUMBER", "")  # يظهر في رسالة الإحصائيات الجاهزة
 CONTACT_WHATSAPP = os.getenv("CONTACT_WHATSAPP", "")  # رقم واتساب عام للتواصل (يظهر للزوار إن ضُبط)
 
@@ -157,6 +162,15 @@ engine = create_engine(
     pool_pre_ping=True,
 )
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+if DATABASE_URL.startswith("sqlite"):
+    @event.listens_for(engine, "connect")
+    def _sqlite_pragmas(dbapi_conn, _record):
+        # WAL: القراءة لا تنتظر الكتابة، والانتظار حتى 15 ثانية بدل خطأ «database is locked»
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA busy_timeout=15000")
+        cur.close()
 
 
 def utcnow() -> datetime:
@@ -270,6 +284,31 @@ class Visit(Base):
     day: Mapped[date] = mapped_column(Date, index=True)
     source: Mapped[str] = mapped_column(String(20))
     count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AppState(Base):
+    """قيم تشغيل صغيرة يجب أن تبقى بعد إعادة التشغيل (مثل تاريخ آخر نسخة احتياطية)."""
+
+    __tablename__ = "app_state"
+
+    key: Mapped[str] = mapped_column(String(40), primary_key=True)
+    value: Mapped[str] = mapped_column(String(200), default="")
+
+
+def state_get(key: str) -> str:
+    with SessionLocal() as db:
+        row = db.get(AppState, key)
+        return row.value if row else ""
+
+
+def state_set(key: str, value: str) -> None:
+    with SessionLocal() as db:
+        row = db.get(AppState, key)
+        if row:
+            row.value = value
+        else:
+            db.add(AppState(key=key, value=value))
+        db.commit()
 
 
 class DealTip(Base):
@@ -435,10 +474,15 @@ def live(deal: "Deal") -> bool:
     return until is None or until >= today() - timedelta(days=GRACE_DAYS)
 
 
+def trial_end() -> date:
+    """نهاية الشهر المجاني: 30 يوماً من اليوم، أو من يوم الإطلاق إن لم يأتِ بعد."""
+    return max(today(), LAUNCH_DATE) + timedelta(days=TRIAL_DAYS)
+
+
 def start_trial(deal: "Deal") -> None:
     """يبدأ الشهر المجاني تلقائياً عند أول نشر لعرض ليس له اشتراك ولا تجربة."""
     if deal.paid_until is None and deal.trial_until is None:
-        deal.trial_until = today() + timedelta(days=TRIAL_DAYS)
+        deal.trial_until = trial_end()
 
 
 def get_db():
@@ -787,7 +831,7 @@ def sync_shop_deals(db: Session, shop: "Shop") -> None:
 
 def shop_start_trial(shop: "Shop") -> None:
     if shop.paid_until is None and shop.trial_until is None:
-        shop.trial_until = today() + timedelta(days=TRIAL_DAYS)
+        shop.trial_until = trial_end()
 
 
 def renew_shop(db: Session, shop: "Shop", vip: bool) -> None:
@@ -799,11 +843,11 @@ def renew_shop(db: Session, shop: "Shop", vip: bool) -> None:
     sync_shop_deals(db, shop)
 
 
-def make_reset_link(db: Session, shop: "Shop", base: str) -> str:
+def make_reset_link(db: Session, shop: "Shop", base: str, minutes: int = RESET_MINUTES) -> str:
     """رابط استرجاع كلمة المرور: يُستعمل مرة واحدة وينتهي بعد RESET_MINUTES. نخزّن بصمته فقط."""
     token = secrets.token_urlsafe(24)
     shop.reset_hash = hashlib.sha256(token.encode()).hexdigest()
-    shop.reset_expires = utcnow() + timedelta(minutes=RESET_MINUTES)
+    shop.reset_expires = utcnow() + timedelta(minutes=minutes)
     db.commit()
     return f"{base}/shop/reset/{token}"
 
@@ -1129,9 +1173,19 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   {% endif %}
 
   <form method="post" action="{{ action }}" enctype="multipart/form-data" class="mt-5 space-y-4">
+    {% if shops %}
+    <label class="block"><span class="text-sm font-bold">المحل</span>
+      <select id="shop_pick" name="shop_id" class="{{ inp }} mt-1">
+        <option value="">— عرض مستقل بدون حساب محل —</option>
+        {% for s in shops %}<option value="{{ s.id }}" {{ 'selected' if form.shop_id == s.id | string }}>{{ s.name }} ({{ s.local_phone }})</option>{% endfor %}
+      </select>
+      <span class="block text-xs text-slate-400 mt-1">اختر المحل ليظهر العرض في بوابته ويُحسب على اشتراكه.</span></label>
+    {% endif %}
     {% if not shop_mode %}
+    <div id="standalone_fields" class="space-y-4">
     <label class="block"><span class="text-sm font-bold">اسم المحل / البيج</span>
-      <input name="shop_name" value="{{ form.shop_name }}" required maxlength="80" class="{{ inp }} mt-1"></label>
+      <input name="shop_name" value="{{ form.shop_name }}" {{ '' if shops else 'required' }} maxlength="80" class="{{ inp }} mt-1"></label>
+    </div>
     {% endif %}
     <label class="block"><span class="text-sm font-bold">وصف العرض</span>
       <input name="title" value="{{ form.title }}" required maxlength="140" placeholder="مثال: وجبة برغر دبل + بطاطا + مشروب" class="{{ inp }} mt-1"></label>
@@ -1160,7 +1214,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
       <input name="link" value="{{ form.link }}" required dir="ltr" placeholder="07701234567" class="{{ inp }} mt-1 text-left">
       <span class="block text-xs text-slate-400 mt-1">اكتب رقم الواتساب، أو اسم حساب الإنستغرام، أو الرابط كاملاً.</span></label>
     {% if not shop_mode %}
-    <label class="block"><span class="text-sm font-bold">رقم للتواصل معك <span class="font-normal text-slate-400">(لا يظهر للزوار)</span></span>
+    <label class="block standalone-only"><span class="text-sm font-bold">رقم للتواصل معك <span class="font-normal text-slate-400">(لا يظهر للزوار)</span></span>
       <input name="contact_phone" value="{{ form.contact_phone }}" inputmode="tel" dir="ltr" placeholder="07701234567" class="{{ inp }} mt-1 text-left"></label>
     {% endif %}
     <label class="block"><span class="text-sm font-bold">صورة العرض {% if deal %}<span class="font-normal text-slate-400">(اتركها فارغة للإبقاء على الصورة الحالية)</span>{% endif %}</span>
@@ -1212,6 +1266,10 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
     if(f.files[0].size>8*1024*1024){alert('حجم الصورة كبير — الحد الأقصى 8 ميغابايت');f.value='';p.classList.add('hidden');return}
     p.src=URL.createObjectURL(f.files[0]);p.classList.remove('hidden');
   });
+  var pick=document.getElementById('shop_pick');
+  if(pick){var sync=function(){var on=!pick.value;
+    document.querySelectorAll('#standalone_fields,.standalone-only').forEach(function(e){e.classList.toggle('hidden',!on)});};
+    pick.addEventListener('change',sync);sync();}
   var btn=document.getElementById('submit_btn');
   btn.form.addEventListener('submit',function(){btn.disabled=true;btn.textContent='جارٍ الإرسال…'});
 })();
@@ -1583,6 +1641,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
         <button class="text-xs font-bold rounded-lg px-3 py-2 border border-white/15 text-slate-200">{{ '▶ تشغيل العرض' if d.paused else '⏸ إيقاف مؤقت' }}</button></form>
       {% endif %}
       <a href="/deal/{{ d.id }}" target="_blank" class="text-xs font-bold rounded-lg px-3 py-2 border border-white/15 text-slate-200">{{ 'عرض في الموقع' if d.is_approved and d.is_live else 'معاينة' }}</a>
+      <a href="/deal/{{ d.id }}/story.jpg" download="lagta-{{ d.id }}.jpg" class="text-xs font-bold rounded-lg px-3 py-2 border border-amber-400/50 text-amber-200">📲 صورة للستوري</a>
       <form method="post" action="/shop/deals/{{ d.id }}/delete" onsubmit="return confirm('حذف هذا العرض نهائياً؟')">
         <button class="text-xs font-bold rounded-lg px-3 py-2 border border-rose-400/40 text-rose-300">حذف</button></form>
     </div>
@@ -1658,11 +1717,11 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
 {% block ambient %}{% endblock %}
 {% block content %}
 <div class="max-w-lg mx-auto pt-10 text-center">
-  <h1 class="text-xl font-extrabold">رابط استرجاع كلمة المرور — {{ shop.name }}</h1>
-  <p class="mt-2 text-sm text-slate-500">صالح {{ minutes }} دقيقة ولمرة واحدة. أرسله لصاحب المحل فقط.</p>
+  <h1 class="text-xl font-extrabold">رابط دخول {{ shop.name }}</h1>
+  <p class="mt-2 text-sm text-slate-500">يعيّن منه صاحب المحل كلمة مروره ويدخل بوابته. صالح {{ days }} أيام ولمرة واحدة — أرسله لصاحب المحل فقط.</p>
   <p class="mt-4 bg-white border border-slate-200 rounded-xl p-3 text-xs font-mono break-all select-all" dir="ltr">{{ link }}</p>
   <div class="mt-4 flex flex-wrap justify-center gap-2">
-    <a href="https://wa.me/{{ shop.phone }}?text={{ ('رابط تعيين كلمة مرور جديدة لحسابك في ' ~ site_name ~ ':\\n' ~ link) | urlencode }}" target="_blank" rel="noopener" class="bg-emerald-600 text-white font-bold rounded-full px-5 py-2.5">أرسله بالواتساب</a>
+    <a href="https://wa.me/{{ shop.phone }}?text={{ ('أهلاً ' ~ shop.name ~ ' 👋\\nهذا رابط بوابة محلك في ' ~ site_name ~ '. منه تختار كلمة مرورك، وتتابع كم شخص شاف عرضك وطلبه، وتعدّل عروضك بنفسك:\\n' ~ link) | urlencode }}" target="_blank" rel="noopener" class="bg-emerald-600 text-white font-bold rounded-full px-5 py-2.5">أرسله بالواتساب</a>
     <a href="/admin" class="border border-slate-300 font-bold rounded-full px-5 py-2.5">رجوع</a>
   </div>
 </div>
@@ -1789,9 +1848,17 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
 
 <details class="mt-3 bg-white rounded-2xl border border-slate-100 p-4" {{ 'open' if shops | rejectattr('verified') | list }}>
   <summary class="font-extrabold cursor-pointer">🏪 المحلات المسجّلة <span class="text-xs font-medium text-slate-400">({{ shops | length }})</span></summary>
+  {% if err == 'shop' %}<p class="mt-2 text-xs font-bold text-rose-700 bg-rose-50 rounded-lg p-2">اكتب اسم المحل ورقم هاتف عراقي صحيح.</p>{% endif %}
+  {% if err == 'dup' %}<p class="mt-2 text-xs font-bold text-rose-700 bg-rose-50 rounded-lg p-2">هذا الرقم مسجّل لمحل موجود في القائمة.</p>{% endif %}
+  <form method="post" action="/admin/shops/new" class="mt-3 grid grid-cols-[1fr_1fr_auto] gap-2 text-sm">
+    <input name="name" required maxlength="80" placeholder="اسم المحل" class="rounded-lg border border-slate-300 px-2 py-2">
+    <input name="phone" required inputmode="tel" dir="ltr" placeholder="07701234567" class="rounded-lg border border-slate-300 px-2 py-2 text-left">
+    <button class="{{ btn }} bg-slate-900 border-slate-900 text-white">➕ إضافة محل</button>
+  </form>
+  <p class="mt-1 text-[11px] text-slate-500">أضف محلاً تواصلت معه، ثم عروضه، ثم أرسل له «رابط الدخول» ليستلم بوابته.</p>
   {% if not bot_ready %}<p class="mt-2 text-xs text-amber-700 bg-amber-50 rounded-lg p-2">بوت تيليغرام غير مفعّل، فالتأكيد الآلي للأرقام متوقف. أكّد المحلات الجديدة يدوياً من الزر أدناه بعد أن يراسلك صاحبها.</p>{% endif %}
   {% for s in shops %}
-  <div class="mt-3 border-t border-slate-100 pt-3 text-sm">
+  <div id="shop-{{ s.id }}" class="mt-3 border-t border-slate-100 pt-3 text-sm">
     <div class="flex flex-wrap items-center gap-1.5">
       <span class="font-extrabold">{{ s.name }}</span>
       <span class="text-slate-500" dir="ltr">{{ s.local_phone }}</span>
@@ -1813,7 +1880,8 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
       <form method="post" action="/admin/shops/{{ s.id }}/trust">
         <button class="{{ btn }} border-slate-300 text-slate-700">{{ 'سحب الثقة (مراجعة كل عرض)' if s.trusted else 'منح الثقة (نشر مباشر)' }}</button></form>
       <form method="post" action="/admin/shops/{{ s.id }}/reset">
-        <button class="{{ btn }} border-slate-300 text-slate-700">🔑 رابط استرجاع كلمة المرور</button></form>
+        <button class="{{ btn }} border-slate-300 text-slate-700">🔑 رابط الدخول للمحل</button></form>
+      <a href="/submit?shop={{ s.id }}" class="{{ btn }} border-slate-300 text-slate-700">+ عرض لهذا المحل</a>
       <a href="https://wa.me/{{ s.phone }}" target="_blank" rel="noopener" class="{{ btn }} border-emerald-300 text-emerald-700">واتساب</a>
       <form method="post" action="/admin/shops/{{ s.id }}/delete" onsubmit="return confirm('حذف المحل وكل عروضه نهائياً؟')">
         <button class="{{ btn }} border-rose-300 text-rose-600">حذف المحل</button></form>
@@ -1899,6 +1967,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
       {% endif %}
       <button type="button" data-copy="{{ messages[d.id] }}" class="{{ btn }} border-slate-300 text-slate-700">نسخ الرسالة</button>
       <a href="/deal/{{ d.id }}" target="_blank" class="{{ btn }} border-slate-300 text-slate-700">عرض</a>
+      <a href="/deal/{{ d.id }}/story.jpg" download="lagta-{{ d.id }}.jpg" class="{{ btn }} border-amber-300 text-amber-700">📲 ستوري</a>
       <a href="/admin/deals/{{ d.id }}/edit" class="{{ btn }} border-slate-300 text-slate-700">تعديل</a>
       <form method="post" action="/admin/deals/{{ d.id }}/delete" onsubmit="return confirm('حذف هذا العرض نهائياً؟')">
         <button class="{{ btn }} border-rose-300 text-rose-600">حذف</button></form>
@@ -2047,7 +2116,7 @@ def tip_submit(request: Request, background: BackgroundTasks, shop_name: str = F
     if website:
         return render("message.html", **thanks)
     rate_key = f"tip:{client_ip(request)}"
-    if too_many(rate_key, limit=5, window=3600):
+    if too_many(rate_key, limit=5, window=3600) or too_many("tip:all", limit=60, window=3600):
         return render("tip.html", 429, form=form, error="أرسلت اقتراحات كثيرة — حاول بعد ساعة.")
     shop_name, where, note = (" ".join(x.split()) for x in (shop_name, where, note))
     if len(shop_name) < 2 or len(where) < 3:
@@ -2055,6 +2124,7 @@ def tip_submit(request: Request, background: BackgroundTasks, shop_name: str = F
     db.add(DealTip(shop_name=shop_name[:80], where=where[:300], note=note[:300]))
     db.commit()
     record_hit(rate_key)
+    record_hit("tip:all")
     background.add_task(tg_admin, f"💡 اقتراح محل جديد من زائر\n{shop_name[:80]}\n{where[:300]}"
                                   + (f"\n{note[:300]}" if note else "") + f"\n\n{site_base(request)}/admin")
     return render("message.html", **thanks)
@@ -2243,7 +2313,138 @@ def order_link(db: Session, deal: "Deal") -> str:
     msg = f"مرحبا، شفت عرضكم «{deal.title}» على {SITE_NAME} بسعر {deal.new_price:,} د.ع."
     if shop and shop.code_offer:
         msg += f"\nكود {SITE_NAME}: {shop.code}"
-    return url + ("&" if parsed.query else "?") + urlencode({"text": msg})
+    # quote وليس quote_plus: المسافة %20 مضمونة في واتساب، أما + فقد تظهر حرفياً
+    return url + ("&" if parsed.query else "?") + urlencode({"text": msg}, quote_via=quote)
+
+
+# ── صورة الستوري: 1080×1920 جاهزة للنشر في ستوري إنستغرام وواتساب ──
+
+FONT_DIR = BASE_DIR / "static" / "fonts"
+STORY_W, STORY_H = 1080, 1920
+
+
+def _font(size: int, heavy: bool = False):
+    """للنص العربي: Noto Sans Arabic، لأنه يحوي أشكال الحروف المتصلة التي يُخرجها التشكيل
+    (Tajawal يفتقد بعضها فتظهر مربعات). وزنه يُضبط من خط متغيّر."""
+    from PIL import ImageFont
+    f = ImageFont.truetype(str(FONT_DIR / "NotoSansArabic.ttf"), size)
+    f.set_variation_by_name("ExtraBold" if heavy else "Bold")
+    return f
+
+
+def _latin_font(size: int):
+    from PIL import ImageFont
+    return ImageFont.truetype(str(FONT_DIR / "Tajawal-ExtraBold.ttf"), size)
+
+
+def _ar(text_: str) -> str:
+    """يشكّل الحروف العربية ويرتبها للعرض: Pillow بدون مكتبة raqm يرسمها مفككة ومعكوسة."""
+    import arabic_reshaper
+    from bidi import get_display
+    return get_display(arabic_reshaper.reshape(text_))
+
+
+def _wrap(draw, text_: str, font, width: int, max_lines: int) -> list[str]:
+    words, lines, line = text_.split(), [], ""
+    for w in words:
+        trial = f"{line} {w}".strip()
+        if draw.textlength(_ar(trial), font=font) <= width:
+            line = trial
+        else:
+            if line:
+                lines.append(line)
+            line = w
+    if line:
+        lines.append(line)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1].rstrip() + "…"
+    return lines
+
+
+def render_story(deal: "Deal", host: str) -> bytes:
+    from PIL import Image, ImageDraw, ImageFilter, ImageOps
+    img = Image.new("RGB", (STORY_W, STORY_H), (10, 10, 15))
+
+    # توهّج خلفي بألوان لقطة
+    glow = Image.new("RGB", (STORY_W, STORY_H), (10, 10, 15))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse((-200, -350, 900, 650), fill=(120, 20, 50))
+    gd.ellipse((450, 1350, 1400, 2200), fill=(110, 50, 15))
+    img = Image.blend(img, glow.filter(ImageFilter.GaussianBlur(160)), 0.9)
+    d = ImageDraw.Draw(img)
+
+    def center(y, text_, font, fill):
+        t = _ar(text_)
+        d.text(((STORY_W - d.textlength(t, font=font)) / 2, y), t, font=font, fill=fill)
+
+    # الشعار
+    center(60, SITE_NAME, _font(96, True), (251, 146, 60))
+    center(185, "كل عروض الموصل بمكان واحد", _font(36), (148, 163, 184))
+
+    # صورة المنتج بزوايا مستديرة
+    size, top = 820, 270
+    try:
+        photo = Image.open(UPLOAD_DIR / Path(deal.image_path).name).convert("RGB")
+        photo = ImageOps.fit(photo, (size, size))
+    except Exception:
+        photo = Image.new("RGB", (size, size), (30, 30, 40))
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, size, size), radius=56, fill=255)
+    left = (STORY_W - size) // 2
+    img.paste(photo, (left, top), mask)
+    ring = (251, 191, 36) if deal.is_vip else (60, 60, 75)
+    d.rounded_rectangle((left - 4, top - 4, left + size + 4, top + size + 4), radius=60, outline=ring, width=6)
+
+    # شارة الخصم
+    badge = f"-{deal.discount_percent}%"
+    bf = _latin_font(72)
+    bw = d.textlength(badge, font=bf) + 60
+    d.rounded_rectangle((left + 30, top + size - 140, left + 30 + bw, top + size - 30), radius=26, fill=(225, 29, 72))
+    d.text((left + 60, top + size - 135), badge, font=bf, fill="white")
+
+    # النصوص
+    y = top + size + 30
+    center(y, deal.shop_name, _font(44, True), (251, 113, 133))
+    y += 80
+    tf = _font(52, True)
+    for line in _wrap(d, deal.title, tf, STORY_W - 160, 2):
+        center(y, line, tf, "white")
+        y += 80
+
+    y += 10
+    center(y, f"{deal.new_price:,} د.ع", _font(92, True), "white")
+    y += 160
+    old = _ar(f"بدل {deal.old_price:,} د.ع")
+    of = _font(42)
+    ow = d.textlength(old, font=of)
+    ox = (STORY_W - ow) / 2
+    d.text((ox, y), old, font=of, fill=(148, 163, 184))
+    d.line((ox, y + 40, ox + ow, y + 40), fill=(148, 163, 184), width=4)
+
+    # زر الطلب والرابط
+    pill_y = STORY_H - 230
+    d.rounded_rectangle((140, pill_y, STORY_W - 140, pill_y + 120), radius=60, fill=(234, 88, 12))
+    center(pill_y + 12, "اطلب العرض من لقطة", _font(52, True), "white")
+    hf = _latin_font(40)
+    d.text(((STORY_W - d.textlength(host, font=hf)) / 2, pill_y + 140), host, font=hf, fill=(203, 213, 225))
+
+    out = BytesIO()
+    img.save(out, "JPEG", quality=88, optimize=True)
+    return out.getvalue()
+
+
+@app.get("/deal/{deal_id}/story.jpg")
+def deal_story(deal_id: DealId, request: Request, db: Session = Depends(get_db)):
+    deal = db.get(Deal, deal_id)
+    shop = current_shop(request, db) if deal and deal.shop_id else None
+    owner = shop is not None and deal is not None and shop.id == deal.shop_id
+    if not deal or not (is_admin(request) or owner or (deal.is_approved and live(deal))):
+        raise HTTPException(404)
+    host = urlparse(PUBLIC_URL or site_base(request)).netloc or "lagta"
+    return Response(render_story(deal, host), media_type="image/jpeg", headers={
+        "Cache-Control": "private, max-age=300",
+        "Content-Disposition": f'inline; filename="lagta-{deal.id}.jpg"'})
 
 
 def count_view(request: Request, response, db: Session, deal_id: int) -> None:
@@ -2304,9 +2505,9 @@ EMPTY_FORM = dict(shop_name="", title="", category="", area="", old_price="", ne
                   link="", contact_phone="")
 
 
-def _submit_page(form: dict, errors: list[str], admin: bool, status: int = 200):
+def _submit_page(form: dict, errors: list[str], admin: bool, status: int = 200, shops=()):
     return render(
-        "deal_form.html", status, form=form, errors=errors, deal=None, action="/submit",
+        "deal_form.html", status, form=form, errors=errors, deal=None, action="/submit", shops=shops,
         heading="أضف عرض محلك",
         intro="" if admin else "أرسل عرضك مجاناً — يظهر في الموقع بعد مراجعة سريعة من الإدارة.",
         submit_label="نشر العرض" if admin else "إرسال العرض للمراجعة",
@@ -2314,8 +2515,12 @@ def _submit_page(form: dict, errors: list[str], admin: bool, status: int = 200):
 
 
 @app.get("/submit", response_class=HTMLResponse)
-def submit_form(request: Request):
-    return _submit_page(EMPTY_FORM, [], is_admin(request))
+def submit_form(request: Request, shop: str = "", db: Session = Depends(get_db)):
+    admin = is_admin(request)
+    if not (admin or ALLOW_ANONYMOUS_SUBMIT):
+        return RedirectResponse("/shop/register", status_code=303)
+    shops = db.scalars(select(Shop).order_by(Shop.name)).all() if admin else ()
+    return _submit_page({**EMPTY_FORM, "shop_id": shop}, [], admin, shops=shops)
 
 
 @app.post("/submit", response_class=HTMLResponse)
@@ -2323,11 +2528,16 @@ def submit_deal(
     request: Request, background: BackgroundTasks,
     shop_name: str = Form(""), title: str = Form(""), category: str = Form(""), area: str = Form(""),
     old_price: str = Form(""), new_price: str = Form(""), link: str = Form(""),
-    contact_phone: str = Form(""), website: str = Form(""), ends_on: str = Form(""),
+    contact_phone: str = Form(""), website: str = Form(""), ends_on: str = Form(""), shop_id: str = Form(""),
     image: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
 ):
     admin = is_admin(request)
+    owner = db.get(Shop, int(shop_id)) if admin and shop_id.isdigit() and len(shop_id) < 10 else None
+    if owner:  # عرض لمحل في البوابة: الاسم والرقم من حسابه
+        shop_name, contact_phone = owner.name, owner.local_phone
+    if not (admin or ALLOW_ANONYMOUS_SUBMIT):
+        return RedirectResponse("/shop/register", status_code=303)
     form = dict(shop_name=shop_name, title=title, category=category, area=area,
                 old_price=old_price, new_price=new_price, link=link, contact_phone=contact_phone)
     thanks = dict(emoji="✅", heading="وصلنا عرضك!",
@@ -2357,13 +2567,22 @@ def submit_deal(
         except ValueError as e:
             errors.append(str(e))
     if errors:
-        return _submit_page(form, errors, admin, 400)
+        form["shop_id"] = shop_id
+        shops = db.scalars(select(Shop).order_by(Shop.name)).all() if admin else ()
+        return _submit_page(form, errors, admin, 400, shops=shops)
 
     deal = Deal(**data, is_approved=admin)
-    if admin:
+    if owner:
+        deal.shop_id = owner.id
+        owner.trusted = True
+        shop_start_trial(owner)
+    elif admin:
         start_trial(deal)  # عروضك تُنشر فوراً ويبدأ شهرها المجاني
     db.add(deal)
     db.commit()
+    if owner:
+        sync_shop_deals(db, owner)
+        db.commit()
     record_hit(rate_key)
     # تلقائياً: عرض المدير يُنشر في القناة، وعرض الزائر يصلك تنبيه به للمراجعة
     background.add_task(announce_deal if admin else notify_admin, deal.id, site_base(request))
@@ -2414,7 +2633,8 @@ def shop_register(request: Request, name: str = Form(""), phone: str = Form(""),
     if website:  # حقل مخفي لا يملؤه إلا السبام
         return RedirectResponse("/shop/login", status_code=303)
     rate_key = f"shop-register:{client_ip(request)}"
-    if too_many(rate_key, limit=5, window=3600):
+    # حدّ إجمالي فوق حدّ العنوان: عنوان الزائر يمكن تزويره عبر X-Forwarded-For
+    if too_many(rate_key, limit=5, window=3600) or too_many("shop-register:all", limit=40, window=3600):
         return _auth_page("register", 429, form=form, error="محاولات كثيرة — حاول بعد ساعة.")
 
     name = " ".join(name.split())[:80]
@@ -2436,6 +2656,7 @@ def shop_register(request: Request, name: str = Form(""), phone: str = Form(""),
     db.add(shop)
     db.commit()
     record_hit(rate_key)
+    record_hit("shop-register:all")
     resp = RedirectResponse("/shop", status_code=303)
     set_shop_cookie(resp, shop, request)
     return resp
@@ -2483,9 +2704,10 @@ def shop_forgot_page():
 @app.post("/shop/forgot")
 def shop_forgot(request: Request, phone: str = Form(""), db: Session = Depends(get_db)):
     rate_key = f"shop-forgot:{client_ip(request)}"
-    if too_many(rate_key, limit=5, window=3600):
+    if too_many(rate_key, limit=5, window=3600) or too_many("shop-forgot:all", limit=60, window=3600):
         return _auth_page("forgot", 429, error="محاولات كثيرة — حاول بعد ساعة.")
     record_hit(rate_key)
+    record_hit("shop-forgot:all")
     shop = db.scalar(select(Shop).where(Shop.phone == normalize_phone(phone)))
     if shop and shop.tg_chat_id:
         link = make_reset_link(db, shop, site_base(request))
@@ -2944,7 +3166,6 @@ def alert_error(where: str, exc: BaseException) -> None:
 
 def _background_loop() -> None:
     setup_telegram()
-    last_backup_day = None
     while True:
         try:
             run_reminders()
@@ -2961,10 +3182,10 @@ def _background_loop() -> None:
                 alert_error("التقرير الأسبوعي", e)
         # النسخة الاحتياطية مرة يومياً، بعد الثالثة فجراً بتوقيت العراق
         local = utcnow() + timedelta(hours=3)
-        if local.hour >= 3 and last_backup_day != local.date():
+        if local.hour >= 3 and state_get("last_backup_day") != local.date().isoformat():
             try:
                 if run_daily_backup():
-                    last_backup_day = local.date()
+                    state_set("last_backup_day", local.date().isoformat())
             except Exception as e:
                 print(f"[backup] failed: {type(e).__name__}")
                 alert_error("النسخ الاحتياطي اليومي", e)
@@ -3010,7 +3231,7 @@ def admin_logout():
 
 
 @app.get("/admin", response_class=HTMLResponse, dependencies=[Depends(require_admin)])
-def admin_dashboard(db: Session = Depends(get_db)):
+def admin_dashboard(err: str = "", db: Session = Depends(get_db)):
     deals = db.scalars(
         select(Deal).order_by(Deal.is_approved.asc(), Deal.is_vip.desc(), Deal.created_at.desc())
     ).all()
@@ -3060,7 +3281,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                   tg_admin=bool(TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_CHAT),
                   trial_days=TRIAL_DAYS, grace_days=GRACE_DAYS,
                   shops=shops, payments=payments, deal_counts=deal_counts, plan_names=PLAN_NAMES,
-                  views_30d=views_30d,
+                  views_30d=views_30d, err=err,
                   tips=db.scalars(select(DealTip).order_by(DealTip.created_at.desc()).limit(50)).all(),
                   bot_ready=bool(bot_url()),
                   goal_percent=min(100, stats["mrr"] * 100 // MONTHLY_GOAL))
@@ -3156,6 +3377,24 @@ def _get_shop(db: Session, shop_id: int) -> Shop:
     return shop
 
 
+@app.post("/admin/shops/new", dependencies=[Depends(require_admin)])
+def admin_shop_new(name: str = Form(""), phone: str = Form(""), db: Session = Depends(get_db)):
+    """تنشئ حساب محل نيابةً عن صاحبه (أنت تعرفه وتتواصل معه): مؤكَّد وموثوق من البداية.
+    كلمة المرور عشوائية لا يعرفها أحد؛ صاحب المحل يعيّن كلمته من «رابط الدخول»."""
+    name = " ".join(name.split())[:80]
+    digits = normalize_phone(phone)
+    if len(name) < 2 or not re.fullmatch(r"9647\d{9}", digits):
+        return RedirectResponse("/admin?err=shop", status_code=303)
+    existing = db.scalar(select(Shop).where(Shop.phone == digits))
+    if existing:
+        return RedirectResponse(f"/admin?err=dup#shop-{existing.id}", status_code=303)
+    shop = Shop(name=name, phone=digits, password_hash=hash_password(secrets.token_urlsafe(24)),
+                verified=True, trusted=True, verify_code=secrets.token_hex(6))
+    db.add(shop)
+    db.commit()
+    return RedirectResponse(f"/submit?shop={shop.id}", status_code=303)
+
+
 @app.post("/admin/shops/{shop_id}/verify", dependencies=[Depends(require_admin)])
 def admin_shop_verify(shop_id: ShopId, db: Session = Depends(get_db)):
     """تأكيد يدوي لمحل ليس عنده تيليغرام (بعد أن تتأكد من رقمه بنفسك، مثلاً برسالة واتساب منه)."""
@@ -3176,8 +3415,8 @@ def admin_shop_trust(shop_id: ShopId, db: Session = Depends(get_db)):
 @app.post("/admin/shops/{shop_id}/reset", response_class=HTMLResponse, dependencies=[Depends(require_admin)])
 def admin_shop_reset(shop_id: ShopId, request: Request, db: Session = Depends(get_db)):
     shop = _get_shop(db, shop_id)
-    link = make_reset_link(db, shop, site_base(request))
-    return render("admin_link.html", shop=shop, link=link, minutes=RESET_MINUTES)
+    link = make_reset_link(db, shop, site_base(request), minutes=CLAIM_DAYS * 24 * 60)
+    return render("admin_link.html", shop=shop, link=link, days=CLAIM_DAYS)
 
 
 @app.post("/admin/shops/{shop_id}/delete", dependencies=[Depends(require_admin)])

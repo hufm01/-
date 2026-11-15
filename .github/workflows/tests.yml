@@ -1,0 +1,43 @@
+# يشغّل كل الاختبارات مع كل رفع. Render مضبوط لينشر فقط بعد نجاح هذا الفحص،
+# فلا يصل أي تعديل معطوب إلى الموقع الحي.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt httpx
+
+      - name: Run test suites
+        run: |
+          set -e
+          for t in tests/test_*.py; do
+            echo "::group::$t"
+            python -W ignore "$t"
+            echo "::endgroup::"
+          done
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: CSS is up to date with the templates
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build:css
+          git diff --exit-code static/app.css || (echo "static/app.css is stale: run 'npm run build:css' and commit it" && exit 1)

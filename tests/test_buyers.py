@@ -5,6 +5,7 @@ from datetime import timedelta
 from urllib.parse import parse_qs, urlparse
 
 os.environ["DATA_DIR"] = tempfile.mkdtemp()
+os.environ["LAUNCH_DATE"] = "2000-01-01"  # these suites test trials counted from today
 os.environ["ADMIN_PASSWORD"] = "test-pass-123"
 os.environ["TELEGRAM_BOT_TOKEN"] = "123:TEST-TOKEN"
 os.environ["TELEGRAM_BOT_USERNAME"] = "lagta_test_bot"

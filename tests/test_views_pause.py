@@ -2,6 +2,7 @@
 import io, os, sys, tempfile
 
 os.environ["DATA_DIR"] = tempfile.mkdtemp()
+os.environ["LAUNCH_DATE"] = "2000-01-01"  # these suites test trials counted from today
 os.environ["ADMIN_PASSWORD"] = "test-pass-123"
 for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHANNEL", "TELEGRAM_ADMIN_CHAT", "DATABASE_URL"):
     os.environ.pop(k, None)

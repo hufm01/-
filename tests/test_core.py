@@ -1,6 +1,8 @@
 import io, os, sys, tempfile
 
 os.environ["DATA_DIR"] = tempfile.mkdtemp()
+os.environ["LAUNCH_DATE"] = "2000-01-01"  # these suites test trials counted from today
+os.environ["ALLOW_ANONYMOUS_SUBMIT"] = "1"  # these suites exercise the anonymous form
 os.environ["ADMIN_PASSWORD"] = "test-pass-123"
 os.environ.pop("DATABASE_URL", None)
 sys.path.insert(0, sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

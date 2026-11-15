@@ -3,6 +3,8 @@ import io, os, sys, tempfile
 from datetime import timedelta
 
 os.environ["DATA_DIR"] = tempfile.mkdtemp()
+os.environ["LAUNCH_DATE"] = "2000-01-01"  # these suites test trials counted from today
+os.environ["ALLOW_ANONYMOUS_SUBMIT"] = "1"  # these suites exercise the anonymous form
 os.environ["ADMIN_PASSWORD"] = "test-pass-123"
 os.environ["TELEGRAM_BOT_TOKEN"] = "123:TEST-TOKEN"
 os.environ["TELEGRAM_CHANNEL"] = "@test_channel"
