@@ -42,7 +42,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from jinja2 import DictLoader, Environment, select_autoescape
 from PIL import Image, ImageOps
-from sqlalchemy import (Boolean, Date, DateTime, Integer, String, UniqueConstraint, and_, create_engine,
+from sqlalchemy import (Boolean, Date, DateTime, Float, Integer, String, UniqueConstraint, and_, create_engine,
                         delete, event, func, inspect, or_, select, text, update)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -378,7 +378,21 @@ class Shop(Base):
     reminded_on: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     code_offer: Mapped[str] = mapped_column(String(80), default="")  # ما يحصل عليه من يقول الكود
     reported_on: Mapped[Optional[date]] = mapped_column(Date, nullable=True)  # آخر تقرير أسبوعي
+    lat: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # موقع المحل على الخريطة
+    lng: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    @property
+    def has_location(self) -> bool:
+        return self.lat is not None and self.lng is not None
+
+    @property
+    def directions_url(self) -> str:
+        return f"https://www.google.com/maps/dir/?api=1&destination={self.lat:.6f},{self.lng:.6f}"
+
+    @property
+    def map_embed_url(self) -> str:
+        return f"https://maps.google.com/maps?q={self.lat:.6f},{self.lng:.6f}&z=16&output=embed"
 
     @property
     def code(self) -> str:
@@ -436,7 +450,8 @@ def ensure_columns() -> None:
                   # العروض الموجودة قبل الميزة تُعتبر مُعلنة، حتى لا تصل للمتابعين كأنها جديدة
                   "followers_notified": "BOOLEAN DEFAULT TRUE"},
         "click_events": {"source": "VARCHAR(20) DEFAULT 'direct'"},
-        "shops": {"code_offer": "VARCHAR(80) DEFAULT ''", "reported_on": "DATE"},
+        "shops": {"code_offer": "VARCHAR(80) DEFAULT ''", "reported_on": "DATE",
+                  "lat": "FLOAT", "lng": "FLOAT"},
     }
     insp = inspect(engine)
     with engine.begin() as conn:
@@ -1335,6 +1350,11 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
       <button type="button" data-url="/deal/{{ deal.id }}" data-share="{{ deal.shop_name }} — {{ deal.title }} بـ {{ deal.new_price | price }} د.ع بدل {{ deal.old_price | price }} 🔥"
               class="shrink-0 px-5 rounded-full border border-white/20 text-sm font-bold text-slate-200 active:scale-95 transition">مشاركة</button>
     </div>
+    {% if owner_shop and owner_shop.has_location %}
+    <a href="{{ owner_shop.directions_url }}" target="_blank" rel="noopener"
+       class="mt-3 flex items-center justify-center gap-2 rounded-full border border-emerald-400/40 bg-emerald-400/10 text-emerald-200 text-sm font-bold py-2.5 active:scale-95 transition">
+      🧭 اذهب للمحل — الاتجاهات على الخريطة</a>
+    {% endif %}
     {% if follow_url %}
     <a href="{{ follow_url }}" target="_blank" rel="noopener"
        class="mt-3 flex items-center justify-center gap-2 rounded-full border border-sky-400/40 bg-sky-400/10 text-sky-200 text-sm font-bold py-2.5 active:scale-95 transition">
@@ -1342,6 +1362,13 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
     {% endif %}
   </div>
 </article>
+
+{% if owner_shop and owner_shop.has_location %}
+<section class="mt-4 rounded-3xl overflow-hidden ring-1 ring-white/10 bg-[#15151c]">
+  <iframe src="{{ owner_shop.map_embed_url }}" loading="lazy" referrerpolicy="no-referrer" class="w-full h-56 border-0" title="موقع {{ deal.shop_name }}"></iframe>
+  <p class="px-4 py-3 text-sm font-bold">📍 موقع {{ deal.shop_name }} <span class="text-xs font-medium text-slate-400">— {{ deal.area }}</span></p>
+</section>
+{% endif %}
 
 {% if similar %}
 <h2 class="mt-6 mb-2 text-base font-extrabold">عروض مشابهة</h2>
@@ -1601,6 +1628,52 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   {% endif %}
 </details>
 
+<details id="location" class="mt-3 rounded-2xl glass p-4" {{ 'open' if not shop.has_location }}>
+  <summary class="font-extrabold cursor-pointer">📍 موقع المحل على الخريطة
+    <span class="text-xs font-medium {{ 'text-emerald-300' if shop.has_location else 'text-amber-300' }}">— {{ 'محدد ✓' if shop.has_location else 'غير محدد' }}</span></summary>
+  <p class="mt-2 text-xs text-slate-400 leading-relaxed">حدّد موقع محلك، فيظهر للزبون زر «🧭 اذهب للمحل» وخريطة صغيرة في صفحة كل عرض، ويفتح له غوغل ماب بالاتجاهات مباشرة.</p>
+  <form method="post" action="/shop/location" id="gps-form" class="mt-3">
+    <input type="hidden" name="lat"><input type="hidden" name="lng">
+    <button type="button" id="gps-btn" class="w-full bg-gradient-to-l from-rose-600 to-orange-500 text-white text-sm font-extrabold rounded-full py-3 active:scale-95 transition">📍 حدّد موقعي الآن (وأنت داخل المحل)</button>
+    <p id="gps-msg" class="mt-2 text-xs text-amber-300 hidden"></p>
+  </form>
+  <form method="post" action="/shop/location" class="mt-3 flex gap-2">
+    <input name="maps" maxlength="2000" dir="ltr" placeholder="أو الصق رابط غوغل ماب أو 36.34, 43.13"
+           class="flex-1 min-w-0 rounded-xl border border-white/15 bg-white/5 text-white placeholder-slate-500 px-3 py-2 text-sm text-left focus:outline-none focus:ring-2 focus:ring-rose-500">
+    <button class="shrink-0 bg-white text-slate-900 text-sm font-bold rounded-full px-4">حفظ</button>
+  </form>
+  <p class="mt-1 text-[11px] text-slate-500">الرابط المختصر (maps.app.goo.gl) لا يعمل هنا. افتحه أولاً في المتصفح ثم انسخ الرابط الطويل، أو استعمل زر «حدّد موقعي».</p>
+  {% if shop.has_location %}
+  <div class="mt-3 rounded-xl overflow-hidden ring-1 ring-white/10">
+    <iframe src="{{ shop.map_embed_url }}" loading="lazy" referrerpolicy="no-referrer" class="w-full h-44 border-0" title="موقع المحل"></iframe>
+  </div>
+  <div class="mt-2 flex gap-2">
+    <a href="{{ shop.directions_url }}" target="_blank" rel="noopener" class="text-xs font-bold rounded-lg px-3 py-2 border border-white/15 text-slate-200">جرّب الاتجاهات</a>
+    <form method="post" action="/shop/location" onsubmit="return confirm('حذف موقع المحل؟')">
+      <input type="hidden" name="clear" value="1">
+      <button class="text-xs font-bold rounded-lg px-3 py-2 border border-rose-400/40 text-rose-300">حذف الموقع</button></form>
+  </div>
+  {% endif %}
+</details>
+<script>
+(function () {
+  var btn = document.getElementById('gps-btn'), form = document.getElementById('gps-form'), msg = document.getElementById('gps-msg');
+  if (!btn) return;
+  function say(t) { msg.textContent = t; msg.classList.remove('hidden'); }
+  btn.addEventListener('click', function () {
+    if (!navigator.geolocation) { say('هاتفك لا يدعم تحديد الموقع. الصق رابط غوغل ماب بدلاً من ذلك.'); return; }
+    btn.disabled = true; btn.textContent = '⏳ جارٍ تحديد موقعك…';
+    navigator.geolocation.getCurrentPosition(function (pos) {
+      form.lat.value = pos.coords.latitude; form.lng.value = pos.coords.longitude; form.submit();
+    }, function (err) {
+      btn.disabled = false; btn.textContent = '📍 حدّد موقعي الآن (وأنت داخل المحل)';
+      say(err.code === 1 ? 'رفضت إذن الموقع. اسمح للمتصفح بالوصول لموقعك من الإعدادات ثم أعد المحاولة.'
+                         : 'لم نستطع تحديد موقعك. شغّل الـ GPS وأعد المحاولة، أو الصق رابط غوغل ماب.');
+    }, { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 });
+  });
+})();
+</script>
+
 <div class="mt-6 flex items-center justify-between">
   <h2 class="text-lg font-extrabold">عروضي <span class="text-sm font-medium text-slate-400">({{ deals | length }} من {{ shop.deal_limit }})</span></h2>
   {% if deals | length < shop.deal_limit %}
@@ -1850,6 +1923,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   <summary class="font-extrabold cursor-pointer">🏪 المحلات المسجّلة <span class="text-xs font-medium text-slate-400">({{ shops | length }})</span></summary>
   {% if err == 'shop' %}<p class="mt-2 text-xs font-bold text-rose-700 bg-rose-50 rounded-lg p-2">اكتب اسم المحل ورقم هاتف عراقي صحيح.</p>{% endif %}
   {% if err == 'dup' %}<p class="mt-2 text-xs font-bold text-rose-700 bg-rose-50 rounded-lg p-2">هذا الرقم مسجّل لمحل موجود في القائمة.</p>{% endif %}
+  {% if err == 'locbad' %}<p class="mt-2 text-xs font-bold text-rose-700 bg-rose-50 rounded-lg p-2">لم نفهم الموقع. الصق رابط غوغل ماب الطويل (لا المختصر) أو إحداثيات مثل 36.34, 43.13.</p>{% endif %}
   <form method="post" action="/admin/shops/new" class="mt-3 grid grid-cols-[1fr_1fr_auto] gap-2 text-sm">
     <input name="name" required maxlength="80" placeholder="اسم المحل" class="rounded-lg border border-slate-300 px-2 py-2">
     <input name="phone" required inputmode="tel" dir="ltr" placeholder="07701234567" class="rounded-lg border border-slate-300 px-2 py-2 text-left">
@@ -1866,6 +1940,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
       {% if s.trusted %}<span class="text-[10px] font-extrabold bg-emerald-100 text-emerald-800 rounded-full px-2 py-0.5">موثوق — ينشر مباشرة</span>{% endif %}
       {% if s.is_vip %}<span class="text-[10px] font-extrabold bg-amber-300 text-amber-950 rounded-full px-2 py-0.5">VIP</span>{% endif %}
       {% if s.tg_chat_id %}<span class="text-[10px] text-sky-700">✈ تيليغرام</span>{% endif %}
+      {% if s.has_location %}<a href="{{ s.directions_url }}" target="_blank" rel="noopener" class="text-[10px] text-emerald-700">📍 الموقع</a>{% endif %}
     </div>
     <p class="text-xs text-slate-500 mt-1">{{ deal_counts.get(s.id, 0) }} عرض ·
       {% if s.active_until is none %}لم يبدأ اشتراكه
@@ -1883,6 +1958,9 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
         <button class="{{ btn }} border-slate-300 text-slate-700">🔑 رابط الدخول للمحل</button></form>
       <a href="/submit?shop={{ s.id }}" class="{{ btn }} border-slate-300 text-slate-700">+ عرض لهذا المحل</a>
       <a href="https://wa.me/{{ s.phone }}" target="_blank" rel="noopener" class="{{ btn }} border-emerald-300 text-emerald-700">واتساب</a>
+      <form method="post" action="/admin/shops/{{ s.id }}/location" class="flex gap-1">
+        <input name="maps" dir="ltr" maxlength="2000" placeholder="رابط غوغل ماب" class="w-36 rounded-lg border border-slate-300 px-2 py-1 text-xs text-left">
+        <button class="{{ btn }} border-slate-300 text-slate-700">📍 {{ 'تغيير الموقع' if s.has_location else 'حفظ الموقع' }}</button></form>
       <form method="post" action="/admin/shops/{{ s.id }}/delete" onsubmit="return confirm('حذف المحل وكل عروضه نهائياً؟')">
         <button class="{{ btn }} border-rose-300 text-rose-600">حذف المحل</button></form>
     </div>
@@ -2779,7 +2857,10 @@ def shop_home(request: Request, ok: str = "", shop: Shop = Depends(require_shop)
               "deleted": "تم حذف العرض.", "paid": "وصلتنا تفاصيل دفعتك وسنؤكدها قريباً.",
               "paused": "تم إيقاف العرض مؤقتاً. لا يظهر للزوار حتى تشغّله.",
               "resumed": "عاد العرض للظهور.", "code": "تم حفظ ميزة الكود.",
-              "sales": "تم تسجيل الزبائن. ✓"}.get(ok, "")
+              "sales": "تم تسجيل الزبائن. ✓",
+              "loc": "📍 تم حفظ موقع المحل. يظهر الآن زر «اذهب للمحل» في صفحات عروضك.",
+              "locdel": "تم حذف موقع المحل.",
+              "locbad": "لم نستطع قراءة الموقع. استعمل زر «حدّد موقعي» وأنت داخل المحل، أو الصق رابط غوغل ماب الكامل."}.get(ok, "")
     resp = render("shop_home.html", shop=shop, deals=deals, clicks_30d=clicks_30d, stats=stats, views_30d=views_30d,
                   code_sales_30d=code_sales_30d,
                   pending_payment=pending_payment, notice=notice, today=today(),
@@ -2909,6 +2990,66 @@ def shop_deal_edit(
 def code_sales_since(db: Session, shop_id: int, days: int) -> int:
     return int(db.scalar(select(func.coalesce(func.sum(CodeSale.count), 0))
                          .where(CodeSale.shop_id == shop_id, CodeSale.day >= today() - timedelta(days=days))))
+
+
+# ── موقع المحل: من GPS الهاتف أو من رابط غوغل ماب ──
+
+# حدود العراق تقريباً: تمنع موقعاً خاطئاً (مثلاً خط العرض والطول مقلوبان)
+IRAQ_BOUNDS = (29.0, 37.5, 38.7, 48.8)
+_COORD = r"(-?\d{1,2}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)"
+_LOC_PATTERNS = [re.compile(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)"),  # مكان محدد في رابط غوغل ماب
+                 re.compile(r"@" + _COORD),
+                 re.compile(r"(?:[?&](?:q|ll|query|destination|daddr)=)(?:loc:)?" + _COORD.replace("\\s*,\\s*", "(?:,|%2C)\\s*")),
+                 re.compile(r"^\s*" + _COORD + r"\s*$")]
+
+
+def in_iraq(lat: float, lng: float) -> bool:
+    a, b, c, d = IRAQ_BOUNDS
+    return a <= lat <= b and c <= lng <= d
+
+
+def parse_location(text_: str) -> Optional[tuple[float, float]]:
+    """يستخرج الإحداثيات من رابط غوغل ماب أو من «36.34, 43.13». الروابط المختصرة (maps.app.goo.gl)
+    لا تحتوي إحداثيات، فلا نستطيع قراءتها بدون فتحها."""
+    text_ = (text_ or "").strip()[:2000]
+    for pat in _LOC_PATTERNS:
+        m = pat.search(text_)
+        if m:
+            try:
+                lat, lng = float(m.group(1)), float(m.group(2))
+            except ValueError:
+                continue
+            if in_iraq(lat, lng):
+                return round(lat, 6), round(lng, 6)
+    return None
+
+
+def set_shop_location(shop: "Shop", lat: str, lng: str, maps: str, clear: str) -> str:
+    """يعيد مفتاح الرسالة: loc (حُفظ)، locdel (حُذف)، أو locbad (لم نفهم الموقع)."""
+    if clear:
+        shop.lat = shop.lng = None
+        return "locdel"
+    point = None
+    if lat and lng:
+        try:
+            la, ln = float(lat), float(lng)
+            point = (round(la, 6), round(ln, 6)) if in_iraq(la, ln) else None
+        except ValueError:
+            point = None
+    elif maps:
+        point = parse_location(maps)
+    if not point:
+        return "locbad"
+    shop.lat, shop.lng = point
+    return "loc"
+
+
+@app.post("/shop/location")
+def shop_location(lat: str = Form(""), lng: str = Form(""), maps: str = Form(""), clear: str = Form(""),
+                  shop: Shop = Depends(require_shop), db: Session = Depends(get_db)):
+    key = set_shop_location(shop, lat, lng, maps, clear)
+    db.commit()
+    return RedirectResponse(f"/shop?ok={key}#location", status_code=303)
 
 
 @app.post("/shop/code")
@@ -3402,6 +3543,15 @@ def admin_shop_verify(shop_id: ShopId, db: Session = Depends(get_db)):
     shop.verified = True  # نُبقي verify_code ليربط حسابه بالبوت لاحقاً إن أراد
     db.commit()
     return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/shops/{shop_id}/location", dependencies=[Depends(require_admin)])
+def admin_shop_location(shop_id: ShopId, maps: str = Form(""), clear: str = Form(""), db: Session = Depends(get_db)):
+    shop = _get_shop(db, shop_id)
+    key = set_shop_location(shop, "", "", maps, clear)
+    db.commit()
+    return RedirectResponse(f"/admin?err=locbad#shop-{shop.id}" if key == "locbad" else f"/admin#shop-{shop.id}",
+                            status_code=303)
 
 
 @app.post("/admin/shops/{shop_id}/trust", dependencies=[Depends(require_admin)])
