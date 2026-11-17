@@ -849,6 +849,17 @@ def shop_start_trial(shop: "Shop") -> None:
         shop.trial_until = trial_end()
 
 
+def enforce_deal_limit(db: Session, shop: "Shop") -> int:
+    """إن نزلت الباقة (VIP ← الأساسية) يبقى الأحدث ظاهراً بعدد الباقة ويُوقف الباقي مؤقتاً.
+    لا يُحذف شيء: المحل يختار بنفسه أي عرض يشغّل. يعيد عدد العروض التي أُوقفت."""
+    active = db.scalars(select(Deal).where(Deal.shop_id == shop.id, or_(Deal.paused.is_(None), Deal.paused.is_(False)))
+                        .order_by(Deal.created_at.desc(), Deal.id.desc())).all()
+    extra = active[shop.deal_limit:]
+    for d in extra:
+        d.paused = True
+    return len(extra)
+
+
 def renew_shop(db: Session, shop: "Shop", vip: bool) -> None:
     """يمدّد اشتراك المحل 30 يوماً من نهاية مدته الحالية (أو من اليوم إن انتهت) ويضبط باقته."""
     start = max(shop.active_until or today(), today())
@@ -856,6 +867,7 @@ def renew_shop(db: Session, shop: "Shop", vip: bool) -> None:
     shop.is_vip = vip
     shop.reminded_on = None
     sync_shop_deals(db, shop)
+    enforce_deal_limit(db, shop)
 
 
 def make_reset_link(db: Session, shop: "Shop", base: str, minutes: int = RESET_MINUTES) -> str:
@@ -1314,7 +1326,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
 {% block content %}
 <a href="/" class="inline-block mt-3 text-sm font-bold text-slate-500">→ كل العروض</a>
 {% if not deal.is_approved %}
-<p class="mt-2 bg-rose-50 border border-rose-200 text-rose-700 text-sm font-bold rounded-xl p-3">هذا العرض غير منشور — تراه لأنك مسجّل كمدير.</p>
+<p class="mt-2 bg-rose-50 border border-rose-200 text-rose-700 text-sm font-bold rounded-xl p-3">هذا العرض غير منشور بعد — {{ 'تراه لأنك مسجّل كمدير' if is_admin else 'ينتظر مراجعة الإدارة، ولا يراه الزوار حالياً' }}.</p>
 {% endif %}
 <article class="mt-2 bg-[#15151c] rounded-3xl overflow-hidden md:grid md:grid-cols-2
   {{ 'ring-1 ring-amber-400/80 shadow-[0_0_36px_-6px_rgba(251,191,36,.55)]' if deal.is_vip else 'ring-1 ring-white/10' }}">
@@ -2318,7 +2330,8 @@ def home(request: Request, area: str = "", category: str = "", page: int = 1, q:
 
     # «الأكثر طلباً»: أعلى 3 عروض نقرات خلال آخر 7 أيام (بحد أدنى حتى لا تظهر الشارة على نقرتين)
     hot_ids = {deal_id for deal_id, n in db.execute(
-        select(ClickEvent.deal_id, func.count()).where(ClickEvent.created_at >= utcnow() - timedelta(days=7))
+        select(ClickEvent.deal_id, func.count()).join(Deal, Deal.id == ClickEvent.deal_id)
+        .where(ClickEvent.created_at >= utcnow() - timedelta(days=7), *is_live)
         .group_by(ClickEvent.deal_id).order_by(func.count().desc()).limit(3)
     ).all() if n >= HOT_MIN_CLICKS}
 
@@ -2369,7 +2382,7 @@ def deal_page(deal_id: DealId, request: Request, db: Session = Depends(get_db)):
         .limit(4)
     ).all()
     base = str(request.base_url).rstrip("/")
-    resp = render("deal.html", deal=deal, similar=similar,
+    resp = render("deal.html", deal=deal, similar=similar, is_admin=admin,
                   og_image=base + deal.image_url, og_url=f"{base}/deal/{deal.id}",
                   jsonld=deal_jsonld(deal, base),
                   follow_url=bot_url(f"f{deal.shop_id}") if deal.shop_id else "",
@@ -2405,14 +2418,14 @@ def _font(size: int, heavy: bool = False):
     """للنص العربي: Noto Sans Arabic، لأنه يحوي أشكال الحروف المتصلة التي يُخرجها التشكيل
     (Tajawal يفتقد بعضها فتظهر مربعات). وزنه يُضبط من خط متغيّر."""
     from PIL import ImageFont
-    f = ImageFont.truetype(str(FONT_DIR / "NotoSansArabic.ttf"), size)
+    f = ImageFont.truetype(str(FONT_DIR / "NotoSansArabic.ttf"), size, layout_engine=ImageFont.Layout.BASIC)
     f.set_variation_by_name("ExtraBold" if heavy else "Bold")
     return f
 
 
 def _latin_font(size: int):
     from PIL import ImageFont
-    return ImageFont.truetype(str(FONT_DIR / "Tajawal-ExtraBold.ttf"), size)
+    return ImageFont.truetype(str(FONT_DIR / "Tajawal-ExtraBold.ttf"), size, layout_engine=ImageFont.Layout.BASIC)
 
 
 def _ar(text_: str) -> str:
@@ -2857,6 +2870,7 @@ def shop_home(request: Request, ok: str = "", shop: Shop = Depends(require_shop)
               "deleted": "تم حذف العرض.", "paid": "وصلتنا تفاصيل دفعتك وسنؤكدها قريباً.",
               "paused": "تم إيقاف العرض مؤقتاً. لا يظهر للزوار حتى تشغّله.",
               "resumed": "عاد العرض للظهور.", "code": "تم حفظ ميزة الكود.",
+              "limit": "باقتك تسمح بعدد محدود من العروض الظاهرة. أوقف عرضاً آخر أولاً، أو رقِّ باقتك.",
               "sales": "تم تسجيل الزبائن. ✓",
               "loc": "📍 تم حفظ موقع المحل. يظهر الآن زر «اذهب للمحل» في صفحات عروضك.",
               "locdel": "تم حذف موقع المحل.",
@@ -2924,6 +2938,10 @@ def shop_deal_new(
     if errors:
         return _shop_deal_page(shop, form, errors, None, 400)
 
+    if shop.trusted:
+        # محل موثوق ينشر مباشرة (مثل محل أضافته الإدارة ثم استلم حسابه): يبدأ شهره المجاني الآن
+        # وإلا بقي عرضه بلا تاريخ انتهاء، أي مجانياً إلى الأبد
+        shop_start_trial(shop)
     deal = Deal(**data, shop_id=shop.id, is_approved=shop.trusted, is_vip=shop.is_vip,
                 trial_until=shop.trial_until, paid_until=shop.paid_until)
     db.add(deal)
@@ -3072,6 +3090,11 @@ def shop_code_sales(count: int = Form(1), shop: Shop = Depends(require_shop), db
 def shop_deal_pause(deal_id: DealId, shop: Shop = Depends(require_shop), db: Session = Depends(get_db)):
     """إيقاف مؤقت (نفدت الكمية، المحل مغلق...) بدون حذف العرض ولا خسارة إحصائياته."""
     deal = _owned_deal(db, shop, deal_id)
+    if deal.paused:
+        running = db.scalar(select(func.count()).select_from(Deal).where(
+            Deal.shop_id == shop.id, Deal.id != deal.id, or_(Deal.paused.is_(None), Deal.paused.is_(False))))
+        if running >= shop.deal_limit:
+            return RedirectResponse("/shop?ok=limit", status_code=303)
     deal.paused = not deal.paused
     db.commit()
     return RedirectResponse(f"/shop?ok={'paused' if deal.paused else 'resumed'}", status_code=303)
@@ -3466,6 +3489,7 @@ def admin_toggle_vip(deal_id: DealId, db: Session = Depends(get_db)):
     if shop:  # الباقة على مستوى المحل: تتغير لكل عروضه معاً
         shop.is_vip = not shop.is_vip
         sync_shop_deals(db, shop)
+        enforce_deal_limit(db, shop)
     else:
         deal.is_vip = not deal.is_vip
     db.commit()
