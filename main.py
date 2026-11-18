@@ -1016,7 +1016,7 @@ select option{background:#15151c;color:#f1f5f9}
 <header class="sticky top-0 z-30 bg-[#0a0a0f]/85 backdrop-blur-md border-b border-white/10">
   <div class="max-w-5xl mx-auto px-4 h-14 flex items-center justify-between">
     <a href="/" class="text-2xl font-extrabold text-white">🔥 <span class="glow-text">{{ site_name }}</span></a>
-    <a href="/shop" class="text-sm font-bold bg-white text-slate-900 rounded-full px-4 py-2 active:scale-95 transition">+ أضف عرض محلك</a>
+    <a href="/shop" class="text-sm font-bold bg-white text-slate-900 rounded-full px-4 py-2 active:scale-95 transition">+ انشر عرضك</a>
   </div>
 </header>
 <main id="main" class="max-w-5xl mx-auto px-4 pb-16" tabindex="-1">{% block content %}{% endblock %}</main>
@@ -1114,7 +1114,7 @@ document.addEventListener('click',function(e){
   <p class="text-5xl">🚀</p>
   <h2 class="mt-3 text-2xl font-extrabold">أول اللقطات <span class="glow-text">بالطريق</span></h2>
   <p class="mt-2 text-sm text-slate-400 max-w-sm mx-auto">دنجمع أقوى عروض محلات الموصل. ارجع قريباً، أو إذا عندك محل خلّي عرضك من أول العروض.</p>
-  <a href="/join" class="mt-5 inline-block bg-gradient-to-l from-rose-600 to-orange-500 text-white font-extrabold rounded-full px-7 py-3 active:scale-95 transition">انشر عرضك مجاناً</a>
+  <a href="/join" class="mt-5 inline-block bg-gradient-to-l from-rose-600 to-orange-500 text-white font-extrabold rounded-full px-7 py-3 active:scale-95 transition">انشر عرضك — أول شهر مجاناً</a>
 </section>
 {% else %}
 
@@ -1170,7 +1170,7 @@ document.addEventListener('click',function(e){
 <section class="mt-10 rounded-3xl glass p-6 text-center">
   <p class="text-xl font-extrabold">عندك محل أو بيج <span class="glow-text">بالموصل</span>؟</p>
   <p class="text-sm text-slate-400 mt-1">انشر عرضك هنا ووصّله لزبائن جدد كل يوم.</p>
-  <a href="/join" class="mt-3 inline-block bg-amber-400 text-amber-950 font-extrabold rounded-xl px-6 py-2.5 active:scale-95 transition">أضف عرضك مجاناً</a>
+  <a href="/join" class="mt-3 inline-block bg-amber-400 text-amber-950 font-extrabold rounded-xl px-6 py-2.5 active:scale-95 transition">انشر عرضك — أول شهر مجاناً</a>
 </section>
 
 <script>
@@ -1194,7 +1194,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   {% if intro %}<p class="text-sm text-slate-500 mt-1">{{ intro }}</p>{% endif %}
 
   {% if errors %}
-  <ul class="mt-4 bg-rose-50 border border-rose-200 text-rose-700 text-sm rounded-xl p-3 space-y-1">
+  <ul class="mt-4 bg-rose-500/10 border border-rose-400/30 text-rose-200 text-sm rounded-xl p-3 space-y-1">
     {% for e in errors %}<li>• {{ e }}</li>{% endfor %}
   </ul>
   {% endif %}
@@ -1245,9 +1245,9 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
       <input name="contact_phone" value="{{ form.contact_phone }}" inputmode="tel" dir="ltr" placeholder="07701234567" class="{{ inp }} mt-1 text-left"></label>
     {% endif %}
     <label class="block"><span class="text-sm font-bold">صورة العرض {% if deal %}<span class="font-normal text-slate-400">(اتركها فارغة للإبقاء على الصورة الحالية)</span>{% endif %}</span>
-      <img id="image_preview" {% if deal %}src="{{ deal.image_url }}"{% endif %} alt="" class="{{ '' if deal else 'hidden' }} mt-2 w-28 h-28 object-cover rounded-xl ring-1 ring-slate-200">
+      <img id="image_preview" {% if deal %}src="{{ deal.image_url }}"{% endif %} alt="" class="{{ '' if deal else 'hidden' }} mt-2 w-28 h-28 object-cover rounded-xl ring-1 ring-white/15">
       <input id="image_input" type="file" name="image" accept="image/jpeg,image/png,image/webp" {{ '' if deal else 'required' }}
-             class="mt-2 block w-full text-sm file:ml-3 file:rounded-full file:border-0 file:bg-rose-50 file:text-rose-700 file:font-bold file:px-4 file:py-2"></label>
+             class="mt-2 block w-full text-sm file:ml-3 file:rounded-full file:border-0 file:bg-white/10 file:text-rose-200 file:font-bold file:px-4 file:py-2"></label>
 
     {% if shop_mode %}
     {% elif deal %}
@@ -1282,9 +1282,9 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   function hint(){
     var a=num(o.value), b=num(n.value);
     if(a===null||b===null){h.className='hidden';return}
-    if(b>=a){h.textContent='السعر بعد الخصم يجب أن يكون أقل من السعر السابق';h.className='-mt-2 text-sm font-bold rounded-xl px-3 py-2 bg-rose-50 text-rose-700';return}
+    if(b>=a){h.textContent='السعر بعد الخصم يجب أن يكون أقل من السعر السابق';h.className='-mt-2 text-sm font-bold rounded-xl px-3 py-2 bg-rose-500/10 text-rose-200';return}
     h.textContent='نسبة الخصم: '+Math.round((a-b)*100/a)+'% — الزبون يوفّر '+(a-b).toLocaleString('en-US')+' د.ع';
-    h.className='-mt-2 text-sm font-bold rounded-xl px-3 py-2 bg-emerald-50 text-emerald-700';
+    h.className='-mt-2 text-sm font-bold rounded-xl px-3 py-2 bg-emerald-500/10 text-emerald-200';
   }
   o.addEventListener('input',hint); n.addEventListener('input',hint); hint();
   var f=document.getElementById('image_input'), p=document.getElementById('image_preview');
@@ -1326,7 +1326,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
 {% block content %}
 <a href="/" class="inline-block mt-3 text-sm font-bold text-slate-500">→ كل العروض</a>
 {% if not deal.is_approved %}
-<p class="mt-2 bg-rose-50 border border-rose-200 text-rose-700 text-sm font-bold rounded-xl p-3">هذا العرض غير منشور بعد — {{ 'تراه لأنك مسجّل كمدير' if is_admin else 'ينتظر مراجعة الإدارة، ولا يراه الزوار حالياً' }}.</p>
+<p class="mt-2 bg-rose-500/10 border border-rose-400/30 text-rose-200 text-sm font-bold rounded-xl p-3">هذا العرض غير منشور بعد — {{ 'تراه لأنك مسجّل كمدير' if is_admin else 'ينتظر مراجعة الإدارة، ولا يراه الزوار حالياً' }}.</p>
 {% endif %}
 <article class="mt-2 bg-[#15151c] rounded-3xl overflow-hidden md:grid md:grid-cols-2
   {{ 'ring-1 ring-amber-400/80 shadow-[0_0_36px_-6px_rgba(251,191,36,.55)]' if deal.is_vip else 'ring-1 ring-white/10' }}">
@@ -1396,7 +1396,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   <p class="inline-flex items-center gap-2 text-[11px] font-bold tracking-wide text-amber-300 border border-amber-400/40 bg-amber-400/10 rounded-full px-3 py-1">لأصحاب المحلات والبيجات</p>
   <h1 class="mt-3 text-4xl md:text-6xl font-extrabold leading-[1.2] tracking-tight">وصّل عرضك <span class="glow-text">لزبائن الموصل</span></h1>
   <p class="mt-3 text-sm md:text-base text-slate-400 max-w-md mx-auto">{{ site_name }} يجمع عروض المدينة بمكان واحد. انشر عرضك، والزبون يضغط ويوصل مباشرة لواتسابك أو صفحتك.</p>
-  <a href="/shop/register" class="mt-5 inline-block bg-gradient-to-l from-rose-600 to-orange-500 text-white font-extrabold rounded-full px-8 py-3.5 active:scale-95 transition">سجّل محلك — شهر مجاناً</a>
+  <a href="/shop/register" class="mt-5 inline-block bg-gradient-to-l from-rose-600 to-orange-500 text-white font-extrabold rounded-full px-8 py-3.5 active:scale-95 transition">انشر عرضك — أول شهر مجاناً</a>
   <p class="mt-3 text-xs text-slate-500">عندك حساب؟ <a href="/shop/login" class="underline font-bold text-slate-300">ادخل لبوابتك</a></p>
 </section>
 
@@ -1457,7 +1457,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
 <section class="mt-10 rounded-3xl glass p-6 text-center">
   <p class="text-xl font-extrabold">جاهز تنشر أول عرض؟</p>
   <div class="mt-4 flex flex-wrap justify-center gap-3">
-    <a href="/shop/register" class="bg-amber-400 text-amber-950 font-extrabold rounded-full px-6 py-3 active:scale-95 transition">سجّل محلك الآن</a>
+    <a href="/shop/register" class="bg-amber-400 text-amber-950 font-extrabold rounded-full px-6 py-3 active:scale-95 transition">انشر عرضك — أول شهر مجاناً</a>
     {% if contact_wa %}<a href="https://wa.me/{{ contact_wa }}" target="_blank" rel="noopener" class="border border-white/20 text-slate-200 font-bold rounded-full px-6 py-3 active:scale-95 transition">راسلنا واتساب</a>{% endif %}
   </div>
 </section>
@@ -1519,8 +1519,8 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
 <div class="max-w-sm mx-auto pt-10">
   <h1 class="text-2xl font-extrabold text-center">{{ heading }}</h1>
   {% if intro %}<p class="mt-2 text-sm text-slate-400 text-center">{{ intro }}</p>{% endif %}
-  {% if error %}<p class="mt-4 bg-rose-50 border border-rose-200 text-rose-700 text-sm rounded-xl p-3">{{ error }}</p>{% endif %}
-  {% if notice %}<p class="mt-4 bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm rounded-xl p-3">{{ notice }}</p>{% endif %}
+  {% if error %}<p class="mt-4 bg-rose-500/10 border border-rose-400/30 text-rose-200 text-sm rounded-xl p-3">{{ error }}</p>{% endif %}
+  {% if notice %}<p class="mt-4 bg-emerald-500/10 border border-emerald-400/30 text-emerald-200 text-sm rounded-xl p-3">{{ notice }}</p>{% endif %}
 
   {% if mode != 'done' %}
   <form method="post" action="{{ action }}" class="mt-5 space-y-4">
@@ -1565,7 +1565,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   <form method="post" action="/shop/logout"><button class="text-sm text-slate-400 underline shrink-0">خروج</button></form>
 </div>
 
-{% if notice %}<p class="mt-4 bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm font-bold rounded-xl p-3">{{ notice }}</p>{% endif %}
+{% if notice %}<p class="mt-4 bg-emerald-500/10 border border-emerald-400/30 text-emerald-200 text-sm font-bold rounded-xl p-3">{{ notice }}</p>{% endif %}
 
 {% if not shop.verified %}
 <section class="mt-4 rounded-3xl glass p-5 text-center">
@@ -1761,7 +1761,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
     <p class="mt-1 text-sm text-slate-400">باقة {{ plan_names[pending.plan] }} — {{ pending.amount | price }} د.ع. يتفعّل اشتراكك فور تأكيد استلام المبلغ{{ '، ويصلك إشعار على تيليغرام' if shop.tg_chat_id else '' }}.</p>
   </section>
   {% else %}
-  {% if errors %}<ul class="mt-4 bg-rose-50 border border-rose-200 text-rose-700 text-sm rounded-xl p-3 space-y-1">{% for e in errors %}<li>• {{ e }}</li>{% endfor %}</ul>{% endif %}
+  {% if errors %}<ul class="mt-4 bg-rose-500/10 border border-rose-400/30 text-rose-200 text-sm rounded-xl p-3 space-y-1">{% for e in errors %}<li>• {{ e }}</li>{% endfor %}</ul>{% endif %}
 
   <form method="post" action="/shop/pay" enctype="multipart/form-data" class="mt-4 space-y-4">
     <fieldset class="grid grid-cols-2 gap-3">
@@ -1791,7 +1791,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
       <input name="txn_ref" value="{{ form.txn_ref }}" maxlength="60" dir="ltr" class="{{ inp }} mt-1 text-left"></label>
     <label class="block"><span class="text-sm font-bold">صورة الإيصال</span>
       <input type="file" name="proof" accept="image/jpeg,image/png,image/webp"
-             class="mt-2 block w-full text-sm file:ml-3 file:rounded-full file:border-0 file:bg-rose-50 file:text-rose-700 file:font-bold file:px-4 file:py-2"></label>
+             class="mt-2 block w-full text-sm file:ml-3 file:rounded-full file:border-0 file:bg-white/10 file:text-rose-200 file:font-bold file:px-4 file:py-2"></label>
     <button class="w-full bg-amber-400 text-amber-950 font-extrabold rounded-full py-3 active:scale-95 transition">أرسل للتأكيد</button>
   </form>
   {% endif %}
@@ -1818,7 +1818,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
 <div class="max-w-md mx-auto pt-8">
   <h1 class="text-2xl font-extrabold">💡 بلّغ عن لقطة</h1>
   <p class="mt-2 text-sm text-slate-400">شفت عرضاً حلواً بمحل مو موجود على {{ site_name }}؟ دلّنا عليه ونحاول نضيفه، حتى يستفيد الكل.</p>
-  {% if error %}<p class="mt-4 bg-rose-50 border border-rose-200 text-rose-700 text-sm rounded-xl p-3">{{ error }}</p>{% endif %}
+  {% if error %}<p class="mt-4 bg-rose-500/10 border border-rose-400/30 text-rose-200 text-sm rounded-xl p-3">{{ error }}</p>{% endif %}
   <form method="post" action="/tip" class="mt-5 space-y-4">
     <label class="block"><span class="text-sm font-bold">اسم المحل أو البيج</span>
       <input name="shop_name" value="{{ form.shop_name }}" required maxlength="80" class="{{ inp }} mt-1"></label>
@@ -1836,7 +1836,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
 {% block content %}
 <form method="post" action="/admin/login" class="max-w-xs mx-auto pt-16 space-y-4">
   <h1 class="text-2xl font-extrabold text-center">🔒 لوحة الإدارة</h1>
-  {% if error %}<p class="bg-rose-50 border border-rose-200 text-rose-700 text-sm rounded-xl p-3">{{ error }}</p>{% endif %}
+  {% if error %}<p class="bg-rose-500/10 border border-rose-400/30 text-rose-200 text-sm rounded-xl p-3">{{ error }}</p>{% endif %}
   <input type="password" name="password" required autofocus placeholder="كلمة المرور" autocomplete="current-password"
          class="w-full rounded-xl border border-white/15 bg-white/5 text-white placeholder-slate-500 px-3 py-2.5 text-base focus:outline-none focus:ring-2 focus:ring-rose-500">
   <button class="w-full bg-white text-slate-900 font-bold rounded-full py-3">دخول</button>
@@ -2601,7 +2601,7 @@ def _submit_page(form: dict, errors: list[str], admin: bool, status: int = 200, 
     return render(
         "deal_form.html", status, form=form, errors=errors, deal=None, action="/submit", shops=shops,
         heading="أضف عرض محلك",
-        intro="" if admin else "أرسل عرضك مجاناً — يظهر في الموقع بعد مراجعة سريعة من الإدارة.",
+        intro="" if admin else "أرسل عرضك، ويظهر في الموقع بعد مراجعة سريعة من الإدارة.",
         submit_label="نشر العرض" if admin else "إرسال العرض للمراجعة",
     )
 
