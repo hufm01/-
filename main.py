@@ -1094,7 +1094,7 @@ document.addEventListener('click',function(e){
 {% block content %}
 <section class="pt-6 pb-2 text-center">
   <p class="inline-flex items-center gap-2 text-[11px] font-bold tracking-wide text-amber-300 border border-amber-400/40 bg-amber-400/10 rounded-full px-3 py-1">
-    <span class="live-dot w-1.5 h-1.5 rounded-full bg-amber-400"></span>لقطات جديدة كل يوم</p>
+    <span class="live-dot w-1.5 h-1.5 rounded-full bg-amber-400"></span>{{ 'لقطات جديدة كل يوم' if total else 'نطلق قريباً' }}</p>
   <h1 class="mt-3 text-4xl md:text-6xl font-extrabold leading-[1.2] tracking-tight">لا تفوّت <span class="glow-text">لقطة</span><br>بالموصل</h1>
   <p class="mt-3 text-sm md:text-base text-slate-400 max-w-md mx-auto">تخفيضات المحلات والمطاعم والبيجات، مرتّبة حسب منطقتك. اختر العرض واطلبه مباشرة.</p>
   {% if total %}

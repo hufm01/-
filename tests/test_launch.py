@@ -134,5 +134,11 @@ h = client().get("/").text
 check("sweets and supermarket categories shown with their icons", "🍰 حلويات ومعجنات" in h and "🛒 سوبرماركت ومواد غذائية" in h
       and len(main.CATEGORIES) == len(main.CATEGORY_ICONS) == 9)
 
+check("homepage badge says daily deals once deals exist", "لقطات جديدة كل يوم" in client().get("/").text)
+with main.SessionLocal() as db:
+    db.execute(main.update(main.Deal).values(is_approved=False)); db.commit()
+check("empty site says launching soon, not daily deals",
+      "نطلق قريباً" in client().get("/").text and "لقطات جديدة كل يوم" not in client().get("/").text)
+
 print(f"\n{sum(ok)}/{len(ok)} passed")
 sys.exit(0 if all(ok) else 1)
