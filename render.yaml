@@ -13,6 +13,8 @@ services:
     envVars:
       - key: DATA_DIR
         value: /data
+      - key: PUBLIC_URL            # العنوان الرسمي: الروابط والتحويل من العنوان القديم و www
+        value: https://laqtamosul.com
       - key: ADMIN_PASSWORD        # تُدخلها أنت في لوحة Render، ولا تُكتب هنا
         sync: false
       - key: ZAINCASH_NUMBER       # رقم زين كاش الذي يظهر في رسالة الإحصائيات

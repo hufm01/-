@@ -126,6 +126,8 @@ TELEGRAM_ADMIN_CHAT = os.getenv("TELEGRAM_ADMIN_CHAT", "")  # رقم محادث�
 BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "").lstrip("@")  # يُجلب تلقائياً عند التشغيل إن لم يُضبط
 # رابط الموقع العام: يلزم لتسجيل البوت وروابط الرسائل. Render يضبط RENDER_EXTERNAL_URL تلقائياً.
 PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+# العنوان الرسمي للموقع (laqtamosul.com): من يدخل عبر *.onrender.com أو www يُحوَّل إليه، فتبقى نسخة واحدة عند غوغل
+CANONICAL_HOST = urlparse(PUBLIC_URL).netloc.lower() if PUBLIC_URL else ""
 WEBHOOK_SECRET = hmac.new(SECRET_KEY, b"tg-webhook:" + TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256).hexdigest()[:40]
 
 # بوابة المحلات
@@ -2218,6 +2220,14 @@ async def limits_and_headers(request: Request, call_next):
     length = request.headers.get("content-length", "")
     if length.isdigit() and int(length) > MAX_BODY_BYTES:  # نرفض قبل أن يُكتب الملف على القرص
         return HTMLResponse("حجم الطلب كبير جداً — الحد الأقصى للصورة 8 ميغابايت.", status_code=413)
+
+    host = request.headers.get("host", "").lower().split(":")[0]
+    path = request.url.path
+    if (CANONICAL_HOST and not CANONICAL_HOST.endswith(".onrender.com") and host and host != CANONICAL_HOST
+            and (host.endswith(".onrender.com") or host == "www." + CANONICAL_HOST)
+            and request.method in ("GET", "HEAD") and path != "/healthz" and not path.startswith("/tg/")):
+        query = ("?" + request.url.query) if request.url.query else ""
+        return RedirectResponse(f"https://{CANONICAL_HOST}{path}{query}", status_code=301)
 
     response = await call_next(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
