@@ -121,7 +121,7 @@ GRACE_DAYS = 3    # مهلة بعد انتهاء المدة قبل أن يُخف
 
 # تيليغرام (اختياري): نشر تلقائي لكل عرض جديد في القناة، وتنبيه لك عند وصول عرض للمراجعة
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")        # مثل @lagta_mosul
+TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")        # مثل @laqta_mosul
 TELEGRAM_ADMIN_CHAT = os.getenv("TELEGRAM_ADMIN_CHAT", "")  # رقم محادثتك مع البوت
 BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "").lstrip("@")  # يُجلب تلقائياً عند التشغيل إن لم يُضبط
 # رابط الموقع العام: يلزم لتسجيل البوت وروابط الرسائل. Render يضبط RENDER_EXTERNAL_URL تلقائياً.
@@ -399,7 +399,7 @@ class Shop(Base):
 
     @property
     def code(self) -> str:
-        return f"LAGTA{self.id}"
+        return f"LAQTA{self.id}"
 
     @property
     def active_until(self) -> Optional[date]:
@@ -1757,7 +1757,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
         <button class="text-xs font-bold rounded-lg px-3 py-2 border border-white/15 text-slate-200">{{ '▶ تشغيل العرض' if d.paused else '⏸ إيقاف مؤقت' }}</button></form>
       {% endif %}
       <a href="/deal/{{ d.id }}" target="_blank" class="text-xs font-bold rounded-lg px-3 py-2 border border-white/15 text-slate-200">{{ 'عرض في الموقع' if d.is_approved and d.is_live else 'معاينة' }}</a>
-      <a href="/deal/{{ d.id }}/story.jpg" download="lagta-{{ d.id }}.jpg" class="text-xs font-bold rounded-lg px-3 py-2 border border-amber-400/50 text-amber-200">📲 صورة للستوري</a>
+      <a href="/deal/{{ d.id }}/story.jpg" download="laqta-{{ d.id }}.jpg" class="text-xs font-bold rounded-lg px-3 py-2 border border-amber-400/50 text-amber-200">📲 صورة للستوري</a>
       <form method="post" action="/shop/deals/{{ d.id }}/delete" onsubmit="return confirm('حذف هذا العرض نهائياً؟')">
         <button class="text-xs font-bold rounded-lg px-3 py-2 border border-rose-400/40 text-rose-300">حذف</button></form>
     </div>
@@ -2130,7 +2130,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
       {% endif %}
       <button type="button" data-copy="{{ messages[d.id] }}" class="{{ btn }} border-slate-300 text-slate-700">نسخ الرسالة</button>
       <a href="/deal/{{ d.id }}" target="_blank" class="{{ btn }} border-slate-300 text-slate-700">عرض</a>
-      <a href="/deal/{{ d.id }}/story.jpg" download="lagta-{{ d.id }}.jpg" class="{{ btn }} border-amber-300 text-amber-700">📲 ستوري</a>
+      <a href="/deal/{{ d.id }}/story.jpg" download="laqta-{{ d.id }}.jpg" class="{{ btn }} border-amber-300 text-amber-700">📲 ستوري</a>
       <a href="/admin/deals/{{ d.id }}/edit" class="{{ btn }} border-slate-300 text-slate-700">تعديل</a>
       <form method="post" action="/admin/deals/{{ d.id }}/delete" onsubmit="return confirm('حذف هذا العرض نهائياً؟')">
         <button class="{{ btn }} border-rose-300 text-rose-600">حذف</button></form>
@@ -2608,10 +2608,10 @@ def deal_story(deal_id: DealId, request: Request, db: Session = Depends(get_db))
     owner = shop is not None and deal is not None and shop.id == deal.shop_id
     if not deal or not (is_admin(request) or owner or (deal.is_approved and live(deal))):
         raise HTTPException(404)
-    host = urlparse(PUBLIC_URL or site_base(request)).netloc or "lagta"
+    host = urlparse(PUBLIC_URL or site_base(request)).netloc or "laqta"
     return Response(render_story(deal, host), media_type="image/jpeg", headers={
         "Cache-Control": "private, max-age=300",
-        "Content-Disposition": f'inline; filename="lagta-{deal.id}.jpg"'})
+        "Content-Disposition": f'inline; filename="laqta-{deal.id}.jpg"'})
 
 
 def count_view(request: Request, response, db: Session, deal_id: int) -> None:
@@ -3374,7 +3374,7 @@ def build_backup() -> tuple[str, bytes]:
         if uploads_size < 40 * 1024 * 1024:  # الصور WebP مضغوطة أصلاً: نضمّها ما دام الحجم يسمح
             tar.add(UPLOAD_DIR, arcname="uploads")
             tar.add(PROOF_DIR, arcname="proofs")
-    return f"lagta-backup-{stamp}.tar.gz", buf.getvalue()
+    return f"laqta-backup-{stamp}.tar.gz", buf.getvalue()
 
 
 def run_daily_backup() -> bool:

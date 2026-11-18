@@ -18,7 +18,7 @@ services:
         sync: false
       - key: TELEGRAM_BOT_TOKEN    # اختياري: توكن البوت من @BotFather (سرّي)
         sync: false
-      - key: TELEGRAM_CHANNEL      # اختياري: اسم القناة مثل @lagta_mosul (البوت مشرف فيها)
+      - key: TELEGRAM_CHANNEL      # اختياري: اسم القناة مثل @laqta_mosul (البوت مشرف فيها)
         sync: false
       - key: TELEGRAM_CHANNEL_URL  # اختياري: رابط الانضمام للقناة إن كانت خاصة (https://t.me/+...)
         sync: false

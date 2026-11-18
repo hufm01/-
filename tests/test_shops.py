@@ -6,10 +6,10 @@ os.environ["DATA_DIR"] = tempfile.mkdtemp()
 os.environ["LAUNCH_DATE"] = "2000-01-01"  # these suites test trials counted from today
 os.environ["ADMIN_PASSWORD"] = "test-pass-123"
 os.environ["TELEGRAM_BOT_TOKEN"] = "123:TEST-TOKEN"
-os.environ["TELEGRAM_BOT_USERNAME"] = "lagta_test_bot"
+os.environ["TELEGRAM_BOT_USERNAME"] = "laqta_test_bot"
 os.environ["TELEGRAM_CHANNEL"] = "@test_channel"
 os.environ["TELEGRAM_ADMIN_CHAT"] = "999"
-os.environ["PUBLIC_URL"] = "https://lagta.test"
+os.environ["PUBLIC_URL"] = "https://laqta.test"
 os.environ["ZAINCASH_NUMBER"] = "07700000001"
 os.environ.pop("DATABASE_URL", None)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -77,7 +77,7 @@ r = client().post("/shop/register", data={"name": "منتحل", "phone": "+96477
 check("duplicate phone rejected", r.status_code == 400 and "مسجّل من قبل" in r.text)
 
 h = a.get("/shop").text
-check("unverified sees telegram verify link", f"https://t.me/lagta_test_bot?start=v{s.verify_code}" in h and "أكّد رقم هاتفك" in h)
+check("unverified sees telegram verify link", f"https://t.me/laqta_test_bot?start=v{s.verify_code}" in h and "أكّد رقم هاتفك" in h)
 check("unverified cannot add deals or pay", a.get("/shop/deals/new").status_code == 303 and add_deal(a).status_code == 303
       and a.get("/shop/pay").status_code == 303 and deal_row(1) is None)
 
@@ -192,7 +192,7 @@ check("renewal after lapse counts from today, deals back", shop_row(1).paid_unti
 # ── reminders ──
 patch(main.Shop, 1, paid_until=T + timedelta(days=3), reminded_on=None)
 sent.clear()
-check("reminder sent 3 days before", main.run_reminders() == 1 and "ينتهي بعد 3 أيام" in texts(555)[-1] and "https://lagta.test/shop/pay" in texts(555)[-1])
+check("reminder sent 3 days before", main.run_reminders() == 1 and "ينتهي بعد 3 أيام" in texts(555)[-1] and "https://laqta.test/shop/pay" in texts(555)[-1])
 check("not repeated same day", main.run_reminders() == 0)
 
 # ── login / logout / password reset ──

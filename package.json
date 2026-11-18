@@ -1,5 +1,5 @@
 {
-  "name": "lagta",
+  "name": "laqta",
   "private": true,
   "description": "بناء ملف CSS لموقع لقطة (يُشغَّل مرة عند تغيير التنسيقات، والناتج يُحفظ في static/app.css)",
   "scripts": {

@@ -28,7 +28,7 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 def backup(dest: Path, keep: int | None = None) -> Path:
     dest.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    target = dest / f"lagta-{stamp}"
+    target = dest / f"laqta-{stamp}"
     target.mkdir()
 
     # نسخة متسقة من SQLite حتى لو كان التطبيق يكتب في نفس اللحظة
@@ -48,7 +48,7 @@ def backup(dest: Path, keep: int | None = None) -> Path:
     shutil.rmtree(target)
 
     if keep:
-        old = sorted(dest.glob("lagta-*.zip"))[:-keep]
+        old = sorted(dest.glob("laqta-*.zip"))[:-keep]
         for f in old:
             f.unlink()
     return Path(archive)

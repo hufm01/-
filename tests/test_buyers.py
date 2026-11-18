@@ -8,10 +8,10 @@ os.environ["DATA_DIR"] = tempfile.mkdtemp()
 os.environ["LAUNCH_DATE"] = "2000-01-01"  # these suites test trials counted from today
 os.environ["ADMIN_PASSWORD"] = "test-pass-123"
 os.environ["TELEGRAM_BOT_TOKEN"] = "123:TEST-TOKEN"
-os.environ["TELEGRAM_BOT_USERNAME"] = "lagta_test_bot"
-os.environ["TELEGRAM_CHANNEL"] = "@lagta_mosul"
+os.environ["TELEGRAM_BOT_USERNAME"] = "laqta_test_bot"
+os.environ["TELEGRAM_CHANNEL"] = "@laqta_mosul"
 os.environ["TELEGRAM_ADMIN_CHAT"] = "999"
-os.environ["PUBLIC_URL"] = "https://lagta.test"
+os.environ["PUBLIC_URL"] = "https://laqta.test"
 os.environ.pop("DATABASE_URL", None)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.stdout.reconfigure(encoding="utf-8")
@@ -53,11 +53,11 @@ adm.post("/admin/deals/1/approve")
 
 # ── channel button ──
 h = client().get("/").text
-check("home shows channel button", 'href="https://t.me/lagta_mosul"' in h and "لقطة اليوم" in h)
+check("home shows channel button", 'href="https://t.me/laqta_mosul"' in h and "لقطة اليوم" in h)
 
 # ── follow a shop ──
 h = client().get("/deal/1").text
-check("deal page has follow button", "https://t.me/lagta_test_bot?start=f1" in h and "تابع برغر الموصل" in h)
+check("deal page has follow button", "https://t.me/laqta_test_bot?start=f1" in h and "تابع برغر الموصل" in h)
 say(700, "/start f1"); say(700, "/start f1"); say(701, "/start f1")
 with main.SessionLocal() as db:
     n = db.query(main.ShopFollower).filter_by(shop_id=1).count()
@@ -78,12 +78,12 @@ s.post("/shop/deals/new", data=deal_form(title="بيتزا عائلية"), files
 f700 = [p for p in to(700) if "عرض جديد من محل تتابعه" in txt(p)]
 check("new deal sent to each follower", len(f700) == 1 and len([p for p in to(701) if "تتابعه" in txt(p)]) == 1
       and "src=follow" in txt(f700[0]))
-main.announce_deal(2, "https://lagta.test")
+main.announce_deal(2, "https://laqta.test")
 check("never sent twice", len([p for p in to(700) if "تتابعه" in txt(p)]) == 1)
 say(700, "/stop")
 check("/stop unfollows", main.SessionLocal().query(main.ShopFollower).filter_by(chat_id="700").count() == 0)
 
-# ── WhatsApp order message + Lagta code ──
+# ── WhatsApp order message + Laqta code ──
 r = client().get("/go/1")
 q = parse_qs(urlparse(r.headers["location"]).query)
 check("whatsapp opens with a ready message naming the site", r.headers["location"].startswith("https://wa.me/9647701234567?text=")
@@ -91,9 +91,9 @@ check("whatsapp opens with a ready message naming the site", r.headers["location
 check("no code box before shop sets an offer", "كود لقطة" not in client().get("/deal/1").text)
 s.post("/shop/code", data={"code_offer": "خصم 5% إضافي"})
 h = client().get("/deal/1").text
-check("deal page shows code and offer", "LAGTA1" in h and "خصم 5% إضافي" in h)
+check("deal page shows code and offer", "LAQTA1" in h and "خصم 5% إضافي" in h)
 r = client().get("/go/1")
-check("whatsapp message includes the code", "LAGTA1" in parse_qs(urlparse(r.headers["location"]).query)["text"][0])
+check("whatsapp message includes the code", "LAQTA1" in parse_qs(urlparse(r.headers["location"]).query)["text"][0])
 s.post("/shop/code/sales", data={"count": "3"}); s.post("/shop/code/sales", data={"count": "2"})
 check("code sales logged", "5 زبون قال الكود" in s.get("/shop").text)
 check("bad sales count ignored", s.post("/shop/code/sales", data={"count": "5000"}).status_code == 303
@@ -123,7 +123,7 @@ sent.clear()
 check("weekly report sent", main.run_weekly_reports() == 1)
 rep = txt(to(555)[-1])
 check("report has views, clicks, followers, code sales", "تقرير برغر الموصل الأسبوعي" in rep and "مشاهدة" in rep
-      and "اطلب العرض" in rep and "متابع" in rep and "LAGTA1" in rep and "https://lagta.test/shop" in rep)
+      and "اطلب العرض" in rep and "متابع" in rep and "LAQTA1" in rep and "https://laqta.test/shop" in rep)
 check("not repeated within the week", main.run_weekly_reports() == 0)
 
 # ── error alert ──
@@ -142,7 +142,7 @@ check("same error throttled", len([p for p in to(999) if "test explosion" in txt
 name, data = main.build_backup()
 with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
     names = tar.getnames()
-check("backup has database and images", name.startswith("lagta-backup-") and "deals.db" in names
+check("backup has database and images", name.startswith("laqta-backup-") and "deals.db" in names
       and any(n.startswith("uploads/") for n in names))
 docs.clear()
 check("backup sent to admin chat", main.run_daily_backup() and docs[0][0] == "999" and "نسخة احتياطية" in docs[0][3])
