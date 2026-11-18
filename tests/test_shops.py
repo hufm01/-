@@ -18,6 +18,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 from fastapi.testclient import TestClient
 from PIL import Image
 import main
+main.PLAN_LIMITS.update(basic=1, vip=3)  # small limits keep the limit logic easy to exercise
 
 ok = []
 def check(name, cond):

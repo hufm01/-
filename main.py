@@ -126,7 +126,7 @@ PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "")
 WEBHOOK_SECRET = hmac.new(SECRET_KEY, b"tg-webhook:" + TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256).hexdigest()[:40]
 
 # بوابة المحلات
-PLAN_LIMITS = {"basic": 1, "vip": 3}   # عدد العروض المسموح لكل باقة
+PLAN_LIMITS = {"basic": 3, "vip": 6}   # عدد العروض المسموح لكل باقة
 PLAN_NAMES = {"basic": "الأساسية", "vip": "VIP"}
 SHOP_COOKIE = "shop_session"
 SHOP_SESSION_DAYS = 30
@@ -1766,7 +1766,7 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   <form method="post" action="/shop/pay" enctype="multipart/form-data" class="mt-4 space-y-4">
     <fieldset class="grid grid-cols-2 gap-3">
       <legend class="sr-only">اختر الباقة</legend>
-      {% for key, price_, lines in [('basic', basic_price, ['عرض واحد منشور', 'إحصائيات حيّة']), ('vip', vip_price, [vip_limit ~ ' عروض', 'تثبيت بأعلى الموقع', 'إطار ذهبي'])] %}
+      {% for key, price_, lines in [('basic', basic_price, [basic_limit ~ ' عروض منشورة', 'إحصائيات حيّة']), ('vip', vip_price, [vip_limit ~ ' عروض', 'تثبيت بأعلى الموقع', 'إطار ذهبي'])] %}
       <label class="block cursor-pointer">
         <input type="radio" name="plan" value="{{ key }}" class="peer sr-only" {{ 'checked' if (form.plan or ('vip' if shop.is_vip else 'basic')) == key }} required>
         <div class="h-full rounded-2xl bg-[#15151c] ring-1 ring-white/10 p-4 peer-checked:ring-2 {{ 'peer-checked:ring-amber-400' if key == 'vip' else 'peer-checked:ring-rose-500' }}">
@@ -2116,6 +2116,7 @@ def render(name: str, status_code: int = 200, **ctx) -> HTMLResponse:
     ctx.setdefault("contact_wa", normalize_phone(CONTACT_WHATSAPP))
     ctx.setdefault("basic_price", BASIC_PRICE)
     ctx.setdefault("vip_price", VIP_PRICE)
+    ctx.setdefault("basic_limit", PLAN_LIMITS["basic"])
     ctx.setdefault("citywide", CITYWIDE)
     ctx.setdefault("channel_url", channel_url())
     return HTMLResponse(jinja.get_template(name).render(**ctx), status_code=status_code)

@@ -113,5 +113,16 @@ check("paused deal: story hidden from public, owner still gets it", client().get
       and o.get("/deal/1/story.jpg").status_code == 200)
 check("unknown deal story 404", client().get("/deal/999/story.jpg").status_code == 404)
 
+# ── plan limits: 3 deals on basic / free month, 6 on VIP ──
+check("plan limits are 3 basic / 6 VIP", main.PLAN_LIMITS == {"basic": 3, "vip": 6})
+o.post("/shop/deals/1/pause")  # resume the deal paused above
+for t in ("عرض ثاني", "عرض ثالث", "عرض رابع"):
+    o.post("/shop/deals/new", data={**form(title=t), "ends_on": ""}, files={"image": ("a.png", png(), "image/png")})
+with main.SessionLocal() as db:
+    titles = [d.title for d in db.scalars(main.select(main.Deal).where(main.Deal.shop_id == 1)).all()]
+check("free-month shop can publish 3 deals, 4th refused", len(titles) == 3 and "عرض رابع" not in titles)
+check("portal shows 3 of 3", "(3 من 3)" in o.get("/shop").text)
+check("pay page lists 3 deals for basic", "3 عروض منشورة" in o.get("/shop/pay").text)
+
 print(f"\n{sum(ok)}/{len(ok)} passed")
 sys.exit(0 if all(ok) else 1)
