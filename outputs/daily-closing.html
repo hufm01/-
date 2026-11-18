@@ -1,0 +1,333 @@
+<title>القفلة اليومية</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&family=Readex+Pro:wght@500;600&display=swap">
+<style>
+/* Layout: one column ledger app — header band, three tabs (today's entry / log / accountant summary). Yellow = what you type, as in the paper sheet. */
+:root{
+  --bg:#f3f5f7; --surface:#ffffff; --ink:#18232f; --muted:#5d6b78; --line:#d9e0e6;
+  --brand:#1d4f73; --brand-ink:#ffffff; --input:#fff6cf; --input-line:#e6c94a;
+  --ok:#1f7a4a; --ok-bg:#e3f4ea; --bad:#b3261e; --bad-bg:#fbe5e3; --wait:#8a6d00; --wait-bg:#fff3c4;
+  --f-body:"IBM Plex Sans Arabic",Tahoma,"Segoe UI",sans-serif;
+  --f-display:"Readex Pro","IBM Plex Sans Arabic",Tahoma,sans-serif;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#10161d; --surface:#18212b; --ink:#e6ecf1; --muted:#97a6b3; --line:#2b3845;
+  --brand:#7fb6dd; --brand-ink:#0d1a24; --input:#3a3215; --input-line:#8a7424;
+  --ok:#6fd39c; --ok-bg:#163526; --bad:#ff8a80; --bad-bg:#3d1c1a; --wait:#f0cf5e; --wait-bg:#3a3215; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#10161d; --surface:#18212b; --ink:#e6ecf1; --muted:#97a6b3; --line:#2b3845;
+  --brand:#7fb6dd; --brand-ink:#0d1a24; --input:#3a3215; --input-line:#8a7424;
+  --ok:#6fd39c; --ok-bg:#163526; --bad:#ff8a80; --bad-bg:#3d1c1a; --wait:#f0cf5e; --wait-bg:#3a3215; color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:15px;line-height:1.6;direction:rtl}
+.wrap{max-width:980px;margin:0 auto;padding-block:20px 48px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));display:grid;gap:18px}
+header{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:10px}
+h1{font-family:var(--f-display);font-size:1.6rem;margin:0;text-wrap:balance}
+.meta{color:var(--muted);font-size:.9rem;display:flex;gap:14px;flex-wrap:wrap}
+.meta b{color:var(--ink);font-weight:600}
+.tabs{display:flex;gap:6px;border-bottom:1px solid var(--line);overflow-x:auto}
+.tabs button{font:inherit;font-weight:600;background:none;border:0;border-bottom:3px solid transparent;color:var(--muted);padding:8px 14px;cursor:pointer;white-space:nowrap}
+.tabs button[aria-selected="true"]{color:var(--brand);border-color:var(--brand)}
+.tabs button:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+section.panel{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:18px;display:grid;gap:16px;min-width:0}
+h2{font-family:var(--f-display);font-size:1.1rem;margin:0}
+.hint{color:var(--muted);font-size:.85rem;margin:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+label{display:grid;gap:4px;font-size:.88rem;font-weight:600}
+label small{font-weight:400;color:var(--muted)}
+input,select,textarea{font:inherit;width:100%;padding:9px 11px;border-radius:7px;border:1px solid var(--line);background:var(--surface);color:var(--ink);font-variant-numeric:tabular-nums}
+input.in,textarea.in{background:var(--input);border-color:var(--input-line)}
+textarea{min-height:60px;resize:vertical}
+.calc{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.calc div{background:var(--surface);padding:10px 12px;display:grid;gap:2px}
+.calc span{font-size:.78rem;color:var(--muted)}
+.calc strong{font-size:1.1rem;font-variant-numeric:tabular-nums}
+.verdict{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:8px;font-weight:600}
+.verdict.ok{background:var(--ok-bg);color:var(--ok)} .verdict.bad{background:var(--bad-bg);color:var(--bad)} .verdict.wait{background:var(--wait-bg);color:var(--wait)}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.btn{font:inherit;font-weight:600;border-radius:7px;padding:9px 18px;cursor:pointer;border:1px solid var(--brand);background:var(--brand);color:var(--brand-ink)}
+.btn.ghost{background:transparent;color:var(--brand)}
+.btn.danger{background:transparent;color:var(--bad);border-color:var(--bad)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.msg{font-size:.9rem;color:var(--muted)}
+.tablebox{overflow-x:auto;border:1px solid var(--line);border-radius:8px}
+table{border-collapse:collapse;width:100%;min-width:760px;font-variant-numeric:tabular-nums;font-size:.9rem}
+th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:center;white-space:nowrap}
+th{background:var(--bg);font-weight:600;font-size:.8rem;color:var(--muted)}
+tbody tr{cursor:pointer} tbody tr:hover{background:var(--bg)}
+tfoot td{font-weight:700;background:var(--bg)}
+.pill{display:inline-block;padding:1px 10px;border-radius:99px;font-size:.8rem;font-weight:600}
+.pill.ok{background:var(--ok-bg);color:var(--ok)} .pill.bad{background:var(--bad-bg);color:var(--bad)} .pill.wait{background:var(--wait-bg);color:var(--wait)}
+.neg{color:var(--bad)}
+.sum{display:grid;gap:0;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.sum div{display:flex;justify-content:space-between;gap:12px;padding:9px 14px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
+.sum div:last-child{border-bottom:0}
+.sum div.total{background:var(--bg);font-weight:700}
+.sum small{color:var(--muted);font-weight:400}
+details summary{cursor:pointer;font-weight:600;color:var(--brand)}
+.empty{text-align:center;color:var(--muted);padding:24px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+  <header>
+    <div>
+      <h1>الحسابات اليومية</h1>
+      <div class="meta"><span>الموقع: <b id="mSite">—</b></span><span>اليوزر: <b id="mUser">—</b></span></div>
+    </div>
+    <div class="msg" id="status">جارِ الاتصال…</div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" id="t-entry" aria-selected="true" data-tab="entry">إدخال اليوم</button>
+    <button role="tab" id="t-log" aria-selected="false" data-tab="log">السجل</button>
+    <button role="tab" id="t-sum" aria-selected="false" data-tab="sum">ملخص المحاسب</button>
+    <button role="tab" id="t-set" aria-selected="false" data-tab="set">الإعدادات</button>
+  </nav>
+
+  <!-- ENTRY -->
+  <section class="panel" data-panel="entry">
+    <div><h2>قفلة يوم</h2><p class="hint">املأ الخانات الصفراء فقط. رصيد البداية والبطائق تُنقل من اليوم السابق تلقائياً.</p></div>
+    <div class="grid">
+      <label for="fDate">التاريخ <small id="fDay"></small><input id="fDate" type="date" class="in"></label>
+      <label for="fRec">بطائق مستلمة اليوم<input id="fRec" class="in num" inputmode="numeric" placeholder="0"></label>
+      <label for="fSold">البطائق المباعة<input id="fSold" class="in num" inputmode="numeric" placeholder="0"></label>
+      <label for="fTop">شحن / إضافة للرصيد <small>دينار</small><input id="fTop" class="in num" inputmode="numeric" placeholder="0"></label>
+      <label for="fSpent">المصروف من اليوزر <small>دينار</small><input id="fSpent" class="in num" inputmode="numeric" placeholder="0"></label>
+      <label for="fAct">الرصيد الفعلي في النظام <small>آخر الدوام</small><input id="fAct" class="in num" inputmode="numeric" placeholder="من شاشة سويج"></label>
+    </div>
+    <label for="fNote">ملاحظات <small>اكتب سبب أي فرق</small><textarea id="fNote" class="in"></textarea></label>
+    <div class="calc">
+      <div><span>البطائق أول اليوم</span><strong id="cCardsStart">—</strong></div>
+      <div><span>البطائق المتبقية</span><strong id="cCardsEnd">—</strong></div>
+      <div><span>رصيد بداية الدوام</span><strong id="cStart">—</strong></div>
+      <div><span>الرصيد المفروض نهاية الدوام</span><strong id="cEnd">—</strong></div>
+      <div><span>الفرق</span><strong id="cDiff">—</strong></div>
+    </div>
+    <div class="verdict wait" id="verdict">اكتب أرقام اليوم</div>
+    <div class="row">
+      <button class="btn" id="save">حفظ القفلة</button>
+      <button class="btn danger" id="del" hidden>حذف هذا اليوم</button>
+      <span class="msg" id="saveMsg"></span>
+    </div>
+  </section>
+
+  <!-- LOG -->
+  <section class="panel" data-panel="log" hidden>
+    <div class="row" style="justify-content:space-between"><h2>سجل الأيام</h2>
+      <label for="logMonth" style="grid-auto-flow:column;align-items:center;gap:8px">الشهر<select id="logMonth"></select></label></div>
+    <p class="hint">اضغط على أي يوم لتعديله.</p>
+    <div class="tablebox"><table>
+      <thead><tr><th>اليوم</th><th>التاريخ</th><th>البطائق الكلية</th><th>المباعة</th><th>المتبقية</th><th>بداية الدوام</th><th>شحن</th><th>المصروف</th><th>المفروض</th><th>الفعلي</th><th>الفرق</th><th>الحالة</th></tr></thead>
+      <tbody id="logBody"></tbody><tfoot id="logFoot"></tfoot>
+    </table></div>
+  </section>
+
+  <!-- SUMMARY -->
+  <section class="panel" data-panel="sum" hidden>
+    <div class="row" style="justify-content:space-between"><h2>ملخص القفلة</h2>
+      <label for="sumMonth" style="grid-auto-flow:column;align-items:center;gap:8px">الشهر<select id="sumMonth"></select></label></div>
+    <div class="verdict wait" id="sumVerdict">—</div>
+    <div class="sum" id="sumBox"></div>
+    <div class="row"><button class="btn ghost" id="copy">نسخ الملخص لإرساله</button><span class="msg" id="copyMsg"></span></div>
+    <textarea id="copyText" readonly hidden></textarea>
+  </section>
+
+  <!-- SETTINGS -->
+  <section class="panel" data-panel="set" hidden>
+    <div><h2>الإعدادات</h2><p class="hint">تُملأ مرة واحدة عند البدء. الرصيد الافتتاحي والبطائق الافتتاحية هي أرقام أول يوم مسجّل.</p></div>
+    <div class="grid">
+      <label for="sSite">الموقع<input id="sSite" class="in"></label>
+      <label for="sUser">رمز اليوزر<input id="sUser" class="in"></label>
+      <label for="sCards">البطائق في أول يوم<input id="sCards" class="in num" inputmode="numeric"></label>
+      <label for="sBal">رصيد اليوزر في أول يوم <small>دينار</small><input id="sBal" class="in num" inputmode="numeric"></label>
+    </div>
+    <div class="row"><button class="btn" id="saveSet">حفظ الإعدادات</button><span class="msg" id="setMsg"></span></div>
+  </section>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const DAYS=["الأحد","الاثنين","الثلاثاء","الأربعاء","الخميس","الجمعة","السبت"];
+const MONTHS=["كانون الثاني","شباط","آذار","نيسان","أيار","حزيران","تموز","آب","أيلول","تشرين الأول","تشرين الثاني","كانون الأول"];
+const fmt=n=>n==null||n===""||isNaN(n)?"—":Math.round(n).toLocaleString("en-US");
+const parse=v=>{if(v==null)return null;v=String(v).replace(/[٠-٩]/g,d=>"٠١٢٣٤٥٦٧٨٩".indexOf(d)).replace(/[^\d.-]/g,"");return v===""?null:Number(v)};
+const dayName=iso=>{if(!iso)return"";const[y,m,d]=iso.split("-").map(Number);return DAYS[new Date(y,m-1,d).getDay()]};
+const dmy=iso=>{const[y,m,d]=iso.split("-");return`${d}/${m}/${y}`};
+const todayIso=()=>{const t=new Date();return`${t.getFullYear()}-${String(t.getMonth()+1).padStart(2,"0")}-${String(t.getDate()).padStart(2,"0")}`};
+const monthLabel=k=>{const[y,m]=k.split("-");return`${MONTHS[+m-1]} ${y}`};
+
+let db=null, settings={site:"",userCode:"",openingCards:0,openingBalance:0}, days={}, canWrite=true;
+
+/* Chain every day in date order: today's start = yesterday's real end (actual if entered, else expected). */
+function chain(){
+  const keys=Object.keys(days).sort(); const out=[];
+  let cards=Number(settings.openingCards)||0, bal=Number(settings.openingBalance)||0;
+  for(const k of keys){
+    const d=days[k], rec=+d.received||0, sold=+d.sold||0, top=+d.topup||0, sp=+d.spent||0;
+    const total=cards+rec, left=total-sold, start=bal, end=start+top-sp;
+    const act=d.actual==null||d.actual===""?null:+d.actual, diff=act==null?null:act-end;
+    out.push({key:k,...d,cardsStart:cards,total,left,start,end,act,diff,
+      state:act==null?"wait":(diff===0&&left>=0?"ok":"bad")});
+    cards=left; bal=act==null?end:act;
+  }
+  return out;
+}
+function prevOf(date){
+  const rows=chain().filter(r=>r.key<date);
+  if(!rows.length)return{cards:+settings.openingCards||0,bal:+settings.openingBalance||0};
+  const r=rows[rows.length-1];return{cards:r.left,bal:r.act==null?r.end:r.act};
+}
+const pill=s=>s==="ok"?'<span class="pill ok">✔ مطابق</span>':s==="bad"?'<span class="pill bad">✖ يوجد فرق</span>':'<span class="pill wait">بانتظار الرصيد الفعلي</span>';
+
+/* ENTRY */
+function loadForm(){
+  const date=$("fDate").value; $("fDay").textContent=dayName(date);
+  const d=days[date];
+  for(const [id,f] of [["fRec","received"],["fSold","sold"],["fTop","topup"],["fSpent","spent"],["fAct","actual"]])
+    $(id).value=d&&d[f]!=null&&d[f]!==""?fmt(d[f]):"";
+  $("fNote").value=d?.note||"";
+  $("del").hidden=!d||!canWrite; $("save").textContent=d?"تحديث القفلة":"حفظ القفلة"; $("saveMsg").textContent="";
+  preview();
+}
+function preview(){
+  const date=$("fDate").value; if(!date)return;
+  const p=prevOf(date), rec=parse($("fRec").value)||0, sold=parse($("fSold").value)||0,
+    top=parse($("fTop").value)||0, sp=parse($("fSpent").value)||0, act=parse($("fAct").value);
+  const left=p.cards+rec-sold, end=p.bal+top-sp, diff=act==null?null:act-end;
+  $("cCardsStart").textContent=fmt(p.cards); $("cCardsEnd").textContent=fmt(left);
+  $("cCardsEnd").className=left<0?"neg":"";
+  $("cStart").textContent=fmt(p.bal); $("cEnd").textContent=fmt(end);
+  $("cDiff").textContent=diff==null?"—":fmt(diff); $("cDiff").className=diff?"neg":"";
+  const v=$("verdict");
+  if(left<0){v.className="verdict bad";v.textContent="✖ عدد المباعة أكبر من البطائق الموجودة";}
+  else if(act==null){v.className="verdict wait";v.textContent="اكتب الرصيد الفعلي من النظام حتى نتحقق من القفلة";}
+  else if(diff===0){v.className="verdict ok";v.textContent="✔ القفلة مطابقة للنظام";}
+  else{v.className="verdict bad";v.textContent=`✖ يوجد فرق ${fmt(diff)} دينار. راجع الأرقام أو اكتب السبب في الملاحظات`;}
+}
+for(const el of document.querySelectorAll(".num")) el.addEventListener("blur",()=>{const n=parse(el.value);el.value=n==null?"":fmt(n)});
+for(const id of ["fRec","fSold","fTop","fSpent","fAct"]) $(id).addEventListener("input",preview);
+$("fDate").addEventListener("change",loadForm);
+
+$("save").addEventListener("click",async()=>{
+  const date=$("fDate").value; if(!date){$("saveMsg").textContent="اختر التاريخ أولاً";return}
+  if(!db){$("saveMsg").textContent="لا يوجد اتصال بقاعدة البيانات";return}
+  const data={date,received:parse($("fRec").value)||0,sold:parse($("fSold").value)||0,topup:parse($("fTop").value)||0,
+    spent:parse($("fSpent").value)||0,actual:parse($("fAct").value),note:$("fNote").value.trim(),updatedAt:Date.now()};
+  $("save").disabled=true;$("saveMsg").textContent="جارِ الحفظ…";
+  try{await db.collection("days").doc(date).set(data);$("saveMsg").textContent="تم الحفظ";}
+  catch(e){$("saveMsg").textContent="لم يُحفظ: ليست لديك صلاحية التعديل أو انقطع الاتصال";}
+  $("save").disabled=!canWrite;
+});
+let delArm=false;
+$("del").addEventListener("click",async()=>{
+  if(!delArm){delArm=true;$("del").textContent="اضغط مرة ثانية للتأكيد";setTimeout(()=>{delArm=false;$("del").textContent="حذف هذا اليوم"},4000);return}
+  delArm=false;$("del").textContent="حذف هذا اليوم";
+  try{await db.collection("days").doc($("fDate").value).delete();$("saveMsg").textContent="تم الحذف"}catch(e){$("saveMsg").textContent="لم يُحذف"}
+});
+
+/* MONTH SELECTS */
+function months(){
+  const s=new Set(Object.keys(days).map(k=>k.slice(0,7)));s.add(todayIso().slice(0,7));
+  return[...s].sort().reverse();
+}
+function fillMonths(){
+  for(const id of ["logMonth","sumMonth"]){
+    const sel=$(id),cur=sel.value,ms=months();
+    sel.innerHTML=ms.map(m=>`<option value="${m}">${monthLabel(m)}</option>`).join("");
+    sel.value=ms.includes(cur)?cur:(Object.keys(days).length?Object.keys(days).sort().pop().slice(0,7):ms[0]);
+  }
+}
+
+/* LOG */
+function renderLog(){
+  const m=$("logMonth").value, rows=chain().filter(r=>r.key.startsWith(m));
+  if(!rows.length){$("logBody").innerHTML=`<tr><td colspan="12" class="empty">لا توجد قفلات مسجلة في هذا الشهر. ابدأ من تبويب «إدخال اليوم».</td></tr>`;$("logFoot").innerHTML="";return}
+  $("logBody").innerHTML=rows.map(r=>`<tr data-k="${r.key}"><td>${dayName(r.key)}</td><td>${dmy(r.key)}</td><td>${fmt(r.total)}</td><td>${fmt(r.sold)}</td><td class="${r.left<0?"neg":""}">${fmt(r.left)}</td><td>${fmt(r.start)}</td><td>${fmt(r.topup)}</td><td>${fmt(r.spent)}</td><td>${fmt(r.end)}</td><td>${r.act==null?"—":fmt(r.act)}</td><td class="${r.diff?"neg":""}">${r.diff==null?"—":fmt(r.diff)}</td><td>${pill(r.state)}</td></tr>`).join("");
+  const sum=f=>rows.reduce((a,r)=>a+(+r[f]||0),0);
+  $("logFoot").innerHTML=`<tr><td colspan="3">المجموع</td><td>${fmt(sum("sold"))}</td><td></td><td></td><td>${fmt(sum("topup"))}</td><td>${fmt(sum("spent"))}</td><td colspan="4"></td></tr>`;
+  for(const tr of $("logBody").querySelectorAll("tr[data-k]")) tr.addEventListener("click",()=>{$("fDate").value=tr.dataset.k;loadForm();show("entry")});
+}
+
+/* SUMMARY */
+function summary(){
+  const m=$("sumMonth").value, rows=chain().filter(r=>r.key.startsWith(m));
+  if(!rows.length)return null;
+  const f=rows[0],l=rows[rows.length-1],s=k=>rows.reduce((a,r)=>a+(+r[k]||0),0);
+  return{m,from:f.key,to:l.key,n:rows.length,open:f.start,top:s("topup"),spent:s("spent"),
+    expected:f.start+s("topup")-s("spent"),actual:l.act,cardsOpen:f.cardsStart,rec:s("received"),sold:s("sold"),left:l.left,
+    bad:rows.filter(r=>r.state==="bad").length,wait:rows.filter(r=>r.state==="wait").length,badDays:rows.filter(r=>r.state==="bad")};
+}
+function renderSum(){
+  const S=summary(),v=$("sumVerdict");
+  if(!S){$("sumBox").innerHTML=`<div class="empty" style="display:block">لا توجد قفلات في هذا الشهر.</div>`;v.className="verdict wait";v.textContent="لا توجد بيانات";return}
+  const line=(a,b,c="",cls="")=>`<div class="${cls}"><span>${a} ${c?`<small>${c}</small>`:""}</span><strong>${b}</strong></div>`;
+  const realDiff=S.actual==null?null:S.actual-S.expected;
+  $("sumBox").innerHTML=
+    line("الفترة",`${dmy(S.from)} ← ${dmy(S.to)}`)+line("عدد أيام الدوام",S.n)+
+    line("رصيد اليوزر أول يوم",fmt(S.open),"(أ)")+line("مجموع الشحن",fmt(S.top),"(ب)")+line("مجموع المصروف",fmt(S.spent),"(ج)")+
+    line("الرصيد المفروض آخر يوم",fmt(S.expected),"أ + ب − ج","total")+line("الرصيد الفعلي آخر يوم",S.actual==null?"—":fmt(S.actual),"من النظام")+
+    line("الفرق الكلي",realDiff==null?"—":fmt(realDiff),"","total")+
+    line("البطائق أول يوم",fmt(S.cardsOpen))+line("البطائق المستلمة",fmt(S.rec))+line("البطائق المباعة",fmt(S.sold))+line("البطائق المتبقية",fmt(S.left),"","total")+
+    line("أيام فيها فرق",S.bad)+line("أيام بدون رصيد فعلي",S.wait);
+  if(S.bad===0&&S.wait===0&&realDiff===0){v.className="verdict ok";v.textContent="✔ قفلة الشهر مطابقة";}
+  else if(S.bad>0){v.className="verdict bad";v.textContent=`✖ راجع الأيام: ${S.badDays.map(r=>dmy(r.key)).join("، ")}`;}
+  else{v.className="verdict wait";v.textContent="بعض الأيام بدون رصيد فعلي";}
+}
+$("copy").addEventListener("click",()=>{
+  const S=summary(); if(!S){$("copyMsg").textContent="لا يوجد ما يُنسخ";return}
+  const t=[`قفلة ${monthLabel(S.m)} — ${settings.site||""} — يوزر ${settings.userCode||""}`,
+    `الفترة: ${dmy(S.from)} إلى ${dmy(S.to)} (${S.n} يوم)`,
+    `رصيد أول يوم: ${fmt(S.open)}`,`مجموع الشحن: ${fmt(S.top)}`,`مجموع المصروف: ${fmt(S.spent)}`,
+    `الرصيد المفروض: ${fmt(S.expected)}`,`الرصيد الفعلي: ${S.actual==null?"—":fmt(S.actual)}`,
+    `البطائق: أول يوم ${fmt(S.cardsOpen)}، مستلمة ${fmt(S.rec)}، مباعة ${fmt(S.sold)}، متبقية ${fmt(S.left)}`,
+    `النتيجة: ${$("sumVerdict").textContent}`].join("\n");
+  const ta=$("copyText");ta.value=t;
+  const fallback=()=>{ta.hidden=false;ta.select();$("copyMsg").textContent="حدّد النص وانسخه يدوياً"};
+  try{navigator.clipboard.writeText(t).then(()=>{$("copyMsg").textContent="تم النسخ، الصقه في واتساب أو تيليجرام"},fallback)}catch(e){fallback()}
+});
+
+/* SETTINGS */
+function renderSettings(){
+  $("mSite").textContent=settings.site||"—";$("mUser").textContent=settings.userCode||"—";
+  if(document.activeElement?.closest?.('[data-panel="set"]'))return;
+  $("sSite").value=settings.site||"";$("sUser").value=settings.userCode||"";
+  $("sCards").value=fmt(settings.openingCards||0);$("sBal").value=fmt(settings.openingBalance||0);
+}
+$("saveSet").addEventListener("click",async()=>{
+  if(!db)return;
+  try{await db.doc("settings/main").set({site:$("sSite").value.trim(),userCode:$("sUser").value.trim(),
+    openingCards:parse($("sCards").value)||0,openingBalance:parse($("sBal").value)||0});$("setMsg").textContent="تم الحفظ"}
+  catch(e){$("setMsg").textContent="لم يُحفظ: ليست لديك صلاحية التعديل"}
+});
+
+/* TABS */
+function show(tab){
+  for(const b of document.querySelectorAll(".tabs button"))b.setAttribute("aria-selected",b.dataset.tab===tab);
+  for(const p of document.querySelectorAll("section.panel"))p.hidden=p.dataset.panel!==tab;
+  try{localStorage.setItem("tab",tab)}catch(e){}
+}
+for(const b of document.querySelectorAll(".tabs button"))b.addEventListener("click",()=>show(b.dataset.tab));
+$("logMonth").addEventListener("change",renderLog);$("sumMonth").addEventListener("change",renderSum);
+
+function renderAll(){fillMonths();renderSettings();renderLog();renderSum();preview();}
+
+/* BOOT */
+$("fDate").value=todayIso();loadForm();renderAll();
+try{const t=localStorage.getItem("tab");if(t)show(t)}catch(e){}
+(async()=>{
+  const timer=setTimeout(()=>{$("status").textContent="تعذّر الاتصال. أعد فتح الصفحة."},10000);
+  db=await window.claude?.use?.("db").catch(()=>null);
+  if(!db){clearTimeout(timer);$("status").textContent="سجّل الدخول لعرض وحفظ القفلات";for(const id of["save","saveSet"])$(id).disabled=true;return}
+  const user=await window.claude.use("user").catch(()=>null);
+  if(user&&user.can&&user.can("data.write")===false){canWrite=false;for(const id of["save","saveSet"])$(id).disabled=true;$("status").textContent="عرض فقط";}
+  db.doc("settings/main").onSnapshot(s=>{settings={...settings,...(s.data()||{})};renderAll();},()=>{});
+  db.collection("days").onSnapshot(q=>{
+    clearTimeout(timer);days={};q.docs.forEach(d=>{const v=d.data();if(v)days[d.id]=v});
+    if(canWrite)$("status").textContent=`متصل · ${Object.keys(days).length} يوم مسجل`;
+    const focusIn=document.activeElement?.closest?.('[data-panel="entry"]');
+    renderAll(); if(!focusIn)loadForm();
+  },()=>{clearTimeout(timer);$("status").textContent="تعذّر تحميل البيانات"});
+})();
+</script>
