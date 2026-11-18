@@ -124,5 +124,12 @@ check("free-month shop can publish 3 deals, 4th refused", len(titles) == 3 and "
 check("portal shows 3 of 3", "(3 من 3)" in o.get("/shop").text)
 check("pay page lists 3 deals for basic", "3 عروض منشورة" in o.get("/shop/pay").text)
 
+# ── gifts & flowers category ──
+r = adm.post("/submit", data=form(title="بوكيه ورد جوري", category="هدايا وورود", shop_name="ورد الحدباء"),
+             files={"image": ("a.png", png(), "image/png")})
+home = client().get("/?category=هدايا وورود").text
+check("gifts & flowers deal accepted and filtered", r.status_code == 303 and "بوكيه ورد جوري" in home
+      and "💐 هدايا وورود" in client().get("/").text)
+
 print(f"\n{sum(ok)}/{len(ok)} passed")
 sys.exit(0 if all(ok) else 1)
