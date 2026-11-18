@@ -1399,16 +1399,21 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   <p class="inline-flex items-center gap-2 text-[11px] font-bold tracking-wide text-amber-300 border border-amber-400/40 bg-amber-400/10 rounded-full px-3 py-1">لأصحاب المحلات والبيجات</p>
   <h1 class="mt-3 text-4xl md:text-6xl font-extrabold leading-[1.2] tracking-tight">وصّل عرضك <span class="glow-text">لزبائن الموصل</span></h1>
   <p class="mt-3 text-sm md:text-base text-slate-400 max-w-md mx-auto">{{ site_name }} يجمع عروض المدينة بمكان واحد. انشر عرضك، والزبون يضغط ويوصل مباشرة لواتسابك أو صفحتك.</p>
-  <a href="/shop/register" class="mt-5 inline-block bg-gradient-to-l from-rose-600 to-orange-500 text-white font-extrabold rounded-full px-8 py-3.5 active:scale-95 transition">انشر عرضك — أول شهر مجاناً</a>
+  <div class="mt-5 flex flex-wrap justify-center gap-3">
+    <a href="/shop/register" class="bg-gradient-to-l from-rose-600 to-orange-500 text-white font-extrabold rounded-full px-8 py-3.5 active:scale-95 transition">انشر عرضك — أول شهر مجاناً</a>
+    {% if contact_wa %}<a href="https://wa.me/{{ contact_wa }}" target="_blank" rel="noopener" class="border border-white/20 text-slate-200 font-bold rounded-full px-6 py-3.5 active:scale-95 transition">💬 اسألنا واتساب</a>{% endif %}
+  </div>
   <p class="mt-3 text-xs text-slate-500">عندك حساب؟ <a href="/shop/login" class="underline font-bold text-slate-300">ادخل لبوابتك</a></p>
 </section>
+
+<p class="mt-8 glass rounded-2xl p-4 text-sm text-slate-300 leading-relaxed">👋 {{ site_name }} مشروع موصلي سوّاه طالب من الموصل، حتى يساعد محلات مدينته توصل لزبائن أكثر بسعر بسيط. نشتغل ويا كل محل بنفسنا، وإذا عندك سؤال نجاوبك مباشرة.</p>
 
 <h2 class="mt-10 mb-3 text-lg font-extrabold">شلون يشتغل؟</h2>
 <section class="grid md:grid-cols-3 gap-3">
   {% for n, t, d in [
       ('1', 'أرسل عرضك', 'صورة المنتج، السعر قبل وبعد، ورابط صفحتك أو رقم الواتساب. تاخذ دقيقتين.'),
       ('2', 'نراجعه وننشره', 'نتأكد أن العرض واضح وحقيقي، ثم يظهر في الموقع لكل الزوار.'),
-      ('3', 'تستلم الإحصائية', 'نهاية كل شهر نرسل لك عدد الأشخاص اللي ضغطوا «اطلب العرض» ووصلوا لك.')] %}
+      ('3', 'تشوف النتيجة', 'من بوابتك تشوف بأي وقت كم شخص ضغط «اطلب العرض» ووصل لك، ونهاية الشهر نرسلك الإحصائية.')] %}
   <div class="glass rounded-3xl p-5">
     <p class="w-9 h-9 grid place-items-center rounded-full bg-white text-slate-900 font-extrabold">{{ n }}</p>
     <p class="mt-3 font-extrabold">{{ t }}</p>
@@ -1417,27 +1422,49 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   {% endfor %}
 </section>
 
+<h2 class="mt-10 mb-3 text-lg font-extrabold">شنو تستفيد؟</h2>
+<section class="grid md:grid-cols-2 gap-3">
+  {% for icon, t, d in [
+      ('🎟', 'كود لقطة: تعرف الزبون اللي جاك منّا', 'تحدد ميزة صغيرة (خصم إضافي، هدية، توصيل مجاني) لمن يقول الكود. الكود يطلع بصفحة عرضك وينكتب تلقائياً برسالة الواتساب اللي توصلك، فتعرف بالضبط كم زبون جاك من لقطة.'),
+      ('📊', 'أرقام صادقة بأي وقت', 'بوابتك تبيّن النقرات لآخر 7 أيام و30 يوم. كل شخص ينحسب مرة وحدة، والروبوتات ما تنحسب.'),
+      ('📍', 'محلك على الخريطة', 'ضيف موقع محلك، والزبون يشوفه على الخريطة ويوصل بالاتجاهات بضغطة.'),
+      ('✏️', 'تتحكم بعروضك بنفسك', 'تضيف عرض، تعدّله، أو توقفه من بوابتك وبأي وقت، بدون ما تنتظر أحد.')] %}
+  <div class="glass rounded-3xl p-5">
+    <p class="font-extrabold">{{ icon }} {{ t }}</p>
+    <p class="mt-1 text-sm text-slate-400 leading-relaxed">{{ d }}</p>
+  </div>
+  {% endfor %}
+  {% if tg_channel %}
+  <div class="glass rounded-3xl p-5">
+    <p class="font-extrabold">📣 نشر إضافي على قناة التلغرام</p>
+    <p class="mt-1 text-sm text-slate-400 leading-relaxed">كل عرض ينقبل ينزل تلقائياً على قناة {{ site_name }}، فيوصل لمتابعين أكثر ببلاش.</p>
+  </div>
+  {% endif %}
+</section>
+
 <h2 class="mt-10 mb-3 text-lg font-extrabold">الباقات</h2>
-<p class="glass rounded-2xl p-4 text-sm font-bold text-emerald-300">🎁 أول شهر مجاناً لكل محل — بدون دفع وبدون التزام. تشوف النتيجة بعينك ثم تقرر.</p>
+<p class="glass rounded-2xl p-4 text-sm font-bold text-emerald-300">🎁 أول شهر مجاناً لكل محل ({{ basic_limit }} عروض) — بدون دفع وبدون التزام. تشوف النتيجة بعينك ثم تقرر.</p>
 <section class="mt-3 grid md:grid-cols-2 gap-3">
   <div class="rounded-3xl bg-[#15151c] ring-1 ring-white/10 p-5">
     <p class="font-extrabold">الباقة الأساسية</p>
     <p class="mt-2 text-3xl font-extrabold">{{ basic_price | price }} <span class="text-sm font-bold text-slate-400">د.ع / شهر</span></p>
+    <p class="mt-1 text-xs text-slate-400">يعني {{ (basic_price / 30) | round | int | price }} دينار باليوم تقريباً</p>
     <ul class="mt-4 space-y-2 text-sm text-slate-300">
-      <li>✓ عرضك منشور طول الشهر</li>
-      <li>✓ تغيّر العرض وقت ما تريد</li>
-      <li>✓ يظهر بفلتر منطقتك وفئتك</li>
-      <li>✓ إحصائية شهرية بعدد النقرات</li>
+      <li>✓ <b class="text-white">{{ basic_limit }} عروض</b> بنفس الوقت، منشورة طول الشهر</li>
+      <li>✓ تغيّر عروضك وقت ما تريد</li>
+      <li>✓ تظهر بفلتر منطقتك وفئتك</li>
+      <li>✓ كود لقطة وإحصائية النقرات</li>
     </ul>
   </div>
   <div class="rounded-3xl bg-[#15151c] ring-1 ring-amber-400/80 shadow-[0_0_30px_-6px_rgba(251,191,36,.55)] p-5">
     <p class="font-extrabold"><span class="vip-badge text-amber-950 text-[11px] rounded-full px-2.5 py-1">🔥 VIP</span></p>
     <p class="mt-2 text-3xl font-extrabold">{{ vip_price | price }} <span class="text-sm font-bold text-slate-400">د.ع / شهر</span></p>
+    <p class="mt-1 text-xs text-slate-400">يعني {{ (vip_price / 30) | round | int | price }} دينار باليوم تقريباً</p>
     <ul class="mt-4 space-y-2 text-sm text-slate-300">
       <li>✓ كل مميزات الأساسية</li>
-      <li>✓ عرضك مثبّت بأعلى الموقع</li>
+      <li>✓ <b class="text-white">{{ vip_limit }} عروض</b> بدل {{ basic_limit }}</li>
+      <li>✓ عروضك مثبّتة بأعلى الموقع</li>
       <li>✓ إطار ذهبي وشارة «عرض مميز»</li>
-      <li>✓ أماكن VIP محدودة حتى يبقى عرضك بارزاً</li>
     </ul>
   </div>
 </section>
@@ -1448,7 +1475,8 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
   {% for q, a in [
       ('شلون تحسبون النقرات؟', 'كل شخص يضغط «اطلب العرض» ينحسب مرة واحدة. الضغط المتكرر من نفس الشخص والروبوتات ما تنحسب، حتى يبقى الرقم صادق.'),
       ('شنو يصير بعد الشهر المجاني؟', 'نرسل لك الإحصائية وتختار: تكمل بإحدى الباقتين أو توقف. إذا ما تجدد، العرض ينرفع من الموقع وما عليك أي مبلغ.'),
-      ('أكدر أغيّر العرض خلال الشهر؟', 'نعم، راسلنا بالعرض الجديد ونبدّله لك بنفس اليوم.'),
+      ('أكدر أغيّر العرض خلال الشهر؟', 'نعم، من بوابتك وبأي وقت: تضيف عرض جديد أو تعدّله أو توقفه. العرض الجديد يظهر بعد ما نراجعه.'),
+      ('شنو هو كود لقطة؟', 'كود خاص بمحلك. تحدد ميزة صغيرة لمن يقوله، والكود يوصلك تلقائياً برسالة الزبون على الواتساب، فتعرف كم زبون جاك من لقطة مو بس كم واحد ضغط.'),
       ('عندي بس صفحة إنستغرام، يصير؟', 'يصير. الزبون يضغط ويتحول مباشرة لصفحتك أو لواتسابك.')] %}
   <details class="glass rounded-2xl p-4">
     <summary class="font-bold cursor-pointer">{{ q }}</summary>
@@ -2279,7 +2307,8 @@ def admin_tip_done(tip_id: DealId, db: Session = Depends(get_db)):
 
 @app.get("/join", response_class=HTMLResponse)
 def join_page():
-    return render("join.html")
+    return render("join.html", vip_limit=PLAN_LIMITS["vip"],
+                  tg_channel=bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL))
 
 
 @app.get("/about", response_class=HTMLResponse)
