@@ -7,6 +7,9 @@ services:
     plan: starter
     region: frankfurt
     healthCheckPath: /healthz
+    domains:                       # الدومين الخاص (مسجّل في Cloudflare)، والعنوان القديم lagta.onrender.com يبقى يعمل
+      - laqtamosul.com
+      - www.laqtamosul.com
     envVars:
       - key: DATA_DIR
         value: /data
