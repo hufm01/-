@@ -63,6 +63,8 @@ AREAS = [
 ]
 CATEGORIES = [
     "مطاعم وكافيهات",
+    "حلويات ومعجنات",
+    "سوبرماركت ومواد غذائية",
     "ملابس وأحذية",
     "إلكترونيات",
     "تجميل وعناية",
@@ -70,7 +72,7 @@ CATEGORIES = [
     "ذهب وإكسسوارات",
     "هدايا وورود",
 ]
-CATEGORY_ICONS = dict(zip(CATEGORIES, ["🍔", "👗", "📱", "💄", "🛋️", "💍", "💐"]))
+CATEGORY_ICONS = dict(zip(CATEGORIES, ["🍔", "🍰", "🛒", "👗", "📱", "💄", "🛋️", "💍", "💐"]))
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))

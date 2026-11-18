@@ -130,6 +130,9 @@ r = adm.post("/submit", data=form(title="بوكيه ورد جوري", category="
 home = client().get("/?category=هدايا وورود").text
 check("gifts & flowers deal accepted and filtered", r.status_code == 303 and "بوكيه ورد جوري" in home
       and "💐 هدايا وورود" in client().get("/").text)
+h = client().get("/").text
+check("sweets and supermarket categories shown with their icons", "🍰 حلويات ومعجنات" in h and "🛒 سوبرماركت ومواد غذائية" in h
+      and len(main.CATEGORIES) == len(main.CATEGORY_ICONS) == 9)
 
 print(f"\n{sum(ok)}/{len(ok)} passed")
 sys.exit(0 if all(ok) else 1)
