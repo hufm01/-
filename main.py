@@ -984,7 +984,7 @@ TEMPLATES = {
 <meta property="og:type" content="website">
 <meta property="og:locale" content="ar_IQ">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
-<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="apple-touch-icon" href="/static/logo/apple-touch-icon.png">
 <link rel="manifest" href="/manifest.webmanifest">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1015,7 +1015,7 @@ select option{background:#15151c;color:#f1f5f9}
 <a href="#main" class="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:right-2 focus:z-50 bg-white text-slate-900 font-bold rounded-full px-4 py-2">تخطي إلى المحتوى</a>
 <header class="sticky top-0 z-30 bg-[#0a0a0f]/85 backdrop-blur-md border-b border-white/10">
   <div class="max-w-5xl mx-auto px-4 h-14 flex items-center justify-between">
-    <a href="/" class="text-2xl font-extrabold text-white">🔥 <span class="glow-text">{{ site_name }}</span></a>
+    <a href="/" class="shrink-0"><img src="/static/logo/laqta-mark.svg" alt="{{ site_name }}" width="70" height="42" class="h-10 w-auto"></a>
     <a href="/shop" class="text-sm font-bold bg-white text-slate-900 rounded-full px-4 py-2 active:scale-95 transition">+ انشر عرضك</a>
   </div>
 </header>
@@ -2249,9 +2249,8 @@ def terms_page():
 
 # ── تطبيق الهاتف (PWA) والأيقونة ──
 
-ICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
-            '<rect width="100" height="100" rx="22" fill="#0a0a0f"/>'
-            '<text x="50" y="68" font-size="58" text-anchor="middle">🔥</text></svg>')
+# شعار لقطة (المصدر وأداة توليده في marketing/logo/)
+ICON_SVG = (BASE_DIR / "static" / "logo" / "laqta-icon.svg").read_text(encoding="utf-8")
 
 
 @app.get("/icon.svg")
@@ -2264,7 +2263,9 @@ def manifest():
     data = {
         "name": f"{SITE_NAME} — عروض الموصل", "short_name": SITE_NAME, "lang": "ar", "dir": "rtl",
         "start_url": "/", "display": "standalone", "background_color": "#0a0a0f", "theme_color": "#0a0a0f",
-        "icons": [{"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}],
+        "icons": [{"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"},
+                  {"src": "/static/logo/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+                  {"src": "/static/logo/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}],
     }
     return Response(json.dumps(data, ensure_ascii=False), media_type="application/manifest+json")
 
