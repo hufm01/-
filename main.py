@@ -1934,6 +1934,48 @@ document.querySelectorAll('[data-active]').forEach(function(el){el.scrollIntoVie
 </section>
 {% endif %}
 
+<details id="subs" class="mt-3 bg-white rounded-2xl border border-slate-100 p-4" open>
+  <summary class="font-extrabold cursor-pointer">💳 المحلات المشتركة
+    <span class="text-xs font-medium text-slate-400">({{ subs_summary.paid }} مدفوع · {{ subs_summary.trial }} تجربة · {{ subs_summary.expired }} منتهي)</span></summary>
+  <div class="mt-3 grid grid-cols-2 gap-2 text-center">
+    <div class="bg-emerald-50 rounded-xl p-2.5"><p class="text-lg font-extrabold text-emerald-700">{{ subs_summary.total | price }} <span class="text-xs">د.ع</span></p>
+      <p class="text-[11px] text-slate-500">كل ما دفعته المحلات</p></div>
+    <div class="bg-slate-50 rounded-xl p-2.5"><p class="text-lg font-extrabold text-slate-800">{{ subs_summary.last30 | price }} <span class="text-xs">د.ع</span></p>
+      <p class="text-[11px] text-slate-500">مدفوع خلال آخر 30 يوماً</p></div>
+  </div>
+  {% if subs %}
+  <div class="mt-3 space-y-2">
+    {% for s in subs %}{% set pay = paid_by_shop.get(s.id) %}
+    <a href="#shop-{{ s.id }}" class="block rounded-xl border border-slate-100 p-3 text-xs">
+      <div class="flex items-start justify-between gap-2">
+        <div class="min-w-0">
+          <p class="text-sm font-extrabold truncate">{{ s.name }}</p>
+          <p class="text-[10px] text-slate-400" dir="ltr">{{ s.local_phone }}</p>
+        </div>
+        {% if s.is_paid %}<span class="shrink-0 font-extrabold rounded-full px-2 py-0.5 {{ 'bg-amber-100 text-amber-800' if s.is_vip else 'bg-emerald-100 text-emerald-800' }}">{{ 'VIP' if s.is_vip else 'الأساسية' }}</span>
+        {% elif s.days_left is not none and s.days_left >= 0 %}<span class="shrink-0 font-extrabold rounded-full px-2 py-0.5 bg-sky-100 text-sky-800">🎁 تجربة</span>
+        {% else %}<span class="shrink-0 font-extrabold rounded-full px-2 py-0.5 bg-rose-100 text-rose-700">⛔ منتهي</span>{% endif %}
+      </div>
+      <div class="mt-2 grid grid-cols-3 gap-2 text-center">
+        <div class="bg-slate-50 rounded-lg py-1.5">
+          <p class="font-extrabold">{{ (pay[0] | price) if pay else '—' }}</p>
+          <p class="text-[10px] text-slate-400">{{ (pay[1] ~ ' دفعة') if pay else 'لم يدفع بعد' }}</p></div>
+        <div class="bg-slate-50 rounded-lg py-1.5">
+          <p class="font-extrabold"><span class="text-emerald-700">{{ live_by_shop.get(s.id, 0) }}</span><span class="text-slate-400"> / {{ deal_counts.get(s.id, 0) }}</span></p>
+          <p class="text-[10px] text-slate-400">عرض ظاهر / الكل</p></div>
+        <div class="bg-slate-50 rounded-lg py-1.5">
+          <p class="font-extrabold {{ 'text-rose-600' if s.days_left is not none and s.days_left < 0 else 'text-amber-600' if s.days_left is not none and s.days_left <= 5 else '' }}">{{ s.active_until or '—' }}</p>
+          <p class="text-[10px] text-slate-400">{% if s.days_left is none %}بلا مدة{% elif s.days_left >= 0 %}باقي {{ s.days_left }} يوم{% else %}انتهى منذ {{ -s.days_left }} يوم{% endif %}</p></div>
+      </div>
+      {% if pay %}<p class="mt-1.5 text-[10px] text-slate-400">آخر دفعة {{ pay[2].strftime('%Y-%m-%d') }}</p>{% endif %}
+    </a>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="mt-3 text-sm text-slate-400">لا توجد محلات مشتركة بعد. يبدأ اشتراك المحل (أو شهره المجاني) عند نشر أول عرض له.</p>
+  {% endif %}
+</details>
+
 <details class="mt-3 bg-white rounded-2xl border border-slate-100 p-4" {{ 'open' if shops | rejectattr('verified') | list }}>
   <summary class="font-extrabold cursor-pointer">🏪 المحلات المسجّلة <span class="text-xs font-medium text-slate-400">({{ shops | length }})</span></summary>
   {% if err == 'shop' %}<p class="mt-2 text-xs font-bold text-rose-700 bg-rose-50 rounded-lg p-2">اكتب اسم المحل ورقم هاتف عراقي صحيح.</p>{% endif %}
@@ -3442,6 +3484,23 @@ def admin_dashboard(err: str = "", db: Session = Depends(get_db)):
         key=lambda row: (-row[1], -row[2]),
     )
     messages = {d.id: stats_message(d, clicks_30d.get(d.id, 0)) for d in deals}
+
+    # المحلات المشتركة: كم دفع كل محل، وكم عرضاً له ظاهراً الآن
+    paid_by_shop = {sid: (int(total), n, last) for sid, total, n, last in db.execute(
+        select(Payment.shop_id, func.sum(Payment.amount), func.count(), func.max(Payment.created_at))
+        .where(Payment.status == "approved").group_by(Payment.shop_id)).all()}
+    live_by_shop = dict(db.execute(
+        select(Deal.shop_id, func.count()).where(Deal.shop_id.is_not(None), Deal.is_approved.is_(True), live_deal())
+        .group_by(Deal.shop_id)).all())
+    subs = [s for s in shops if s.active_until or s.id in paid_by_shop]
+    subs.sort(key=lambda s: (0 if s.is_paid else 1 if (s.days_left or -1) >= 0 else 2, -(s.days_left or -999)))
+    last30 = db.scalar(select(func.coalesce(func.sum(Payment.amount), 0)).where(
+        Payment.status == "approved", Payment.created_at >= cutoff))
+    subs_summary = dict(
+        paid=sum(s.is_paid for s in subs),
+        trial=sum(not s.is_paid and (s.days_left or -1) >= 0 for s in subs),
+        expired=sum(not s.is_paid and (s.days_left is None or s.days_left < 0) for s in subs),
+        total=sum(v[0] for v in paid_by_shop.values()), last30=int(last30))
     views_30d = views_since(db, 30)
 
     return render("admin.html", deals=deals, stats=stats, clicks_30d=clicks_30d, sources=sources,
@@ -3451,6 +3510,7 @@ def admin_dashboard(err: str = "", db: Session = Depends(get_db)):
                   trial_days=TRIAL_DAYS, grace_days=GRACE_DAYS,
                   shops=shops, payments=payments, deal_counts=deal_counts, plan_names=PLAN_NAMES,
                   views_30d=views_30d, err=err,
+                  subs=subs, subs_summary=subs_summary, paid_by_shop=paid_by_shop, live_by_shop=live_by_shop,
                   tips=db.scalars(select(DealTip).order_by(DealTip.created_at.desc()).limit(50)).all(),
                   bot_ready=bool(bot_url()),
                   goal_percent=min(100, stats["mrr"] * 100 // MONTHLY_GOAL))
@@ -3513,6 +3573,8 @@ def admin_renew(deal_id: DealId, request: Request, background: BackgroundTasks,
     if shop:
         shop.trusted = True
         renew_shop(db, shop, shop.is_vip)
+        db.add(Payment(shop_id=shop.id, plan="vip" if shop.is_vip else "basic", amount=shop.monthly_fee,
+                       txn_ref="تسجيل يدوي من الإدارة", status="approved"))
     else:
         start = max(deal.active_until or today(), today())
         deal.paid_until = start + timedelta(days=SUBSCRIPTION_DAYS)
